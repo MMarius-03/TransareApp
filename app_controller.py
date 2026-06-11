@@ -6,12 +6,15 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QFileDialog
 
 from app_window import (
     APP_TITLE,
     TEMPLATE_MODE_PREDEFINED_LABEL,
     TEMPLATE_MODE_PREVIOUS_SHEET_LABEL,
+    confirm_warning_dialog,
+    show_error_dialog,
+    show_warning_dialog,
 )
 from processor import (
     MONTH_NAMES,
@@ -92,6 +95,7 @@ class AppController(QObject):
         self.base_dir = (base_dir or Path.cwd()).resolve()
         self.last_output_file: Path | None = None
         self.detected_source_month_name: str | None = None
+        self.detected_source_year: int | None = None
         self._thread: QThread | None = None
         self._worker: RunWorker | None = None
         self._connect_window()
@@ -125,12 +129,14 @@ class AppController(QObject):
                 detected_month = detect_source_month_from_file(path)
             except ProcessorError as exc:
                 self.detected_source_month_name = None
+                self.detected_source_year = None
                 if hasattr(self.window, "set_source_month_hint"):
                     self.window.set_source_month_hint(None)
                 self.window.append_log(f"Avertisment: {exc}")
                 self.window.set_status("Fișierul sursă a fost selectat, dar luna nu a putut fi detectată.", "warning")
             else:
                 self.detected_source_month_name = detected_month.month_name if detected_month is not None else None
+                self.detected_source_year = detected_month.year if detected_month is not None else None
                 if hasattr(self.window, "set_source_month_hint"):
                     self.window.set_source_month_hint(self.detected_source_month_name)
                 if self.detected_source_month_name:
@@ -242,14 +248,21 @@ class AppController(QObject):
             except ProcessorError as exc:
                 self._show_warning(str(exc))
                 return
-            if attendance_month is not None and attendance_month.month_name != normalize_label(values["target_month_name"]):
-                allow_attendance_month_mismatch = self._confirm_attendance_month_mismatch(
-                    f"{attendance_month.month_name} {attendance_month.year}",
-                    values["target_month_name"],
+            if attendance_month is not None:
+                target_month_norm = normalize_label(values["target_month_name"])
+                month_mismatch = attendance_month.month_name != target_month_norm
+                year_mismatch = (
+                    self.detected_source_year is not None
+                    and attendance_month.year != self.detected_source_year
                 )
-                if not allow_attendance_month_mismatch:
-                    self.window.append_log("Procesarea a fost oprită din cauza lunii diferite din Transatori+Detinuți.")
-                    return
+                if month_mismatch or year_mismatch:
+                    allow_attendance_month_mismatch = self._confirm_attendance_month_mismatch(
+                        f"{attendance_month.month_name} {attendance_month.year}",
+                        values["target_month_name"],
+                    )
+                    if not allow_attendance_month_mismatch:
+                        self.window.append_log("Procesarea a fost oprită din cauza lunii diferite din Transatori+Detinuți.")
+                        return
 
         self.window.set_busy(True, last_output_exists=self.last_output_file is not None)
         self.window.set_status("Pornesc procesarea workbook-ului...", "info")
@@ -347,23 +360,20 @@ class AppController(QObject):
             self._show_error(f"Nu am putut deschide fișierul generat: {exc}")
 
     def _show_warning(self, message: str) -> None:
-        QMessageBox.warning(self.window, APP_TITLE, message)
+        show_warning_dialog(self.window, message, APP_TITLE)
 
     def _show_error(self, message: str) -> None:
-        QMessageBox.critical(self.window, APP_TITLE, message)
+        show_error_dialog(self.window, message, APP_TITLE)
 
     def _confirm_attendance_month_mismatch(self, attendance_month: str, target_month_name: str) -> bool:
-        result = QMessageBox.warning(
+        return confirm_warning_dialog(
             self.window,
-            APP_TITLE,
             "Luna din Transatori+Detinuți pare diferită.\n\n"
             f"Fișier Transatori+Detinuți: {attendance_month}\n"
             f"Luna țintă selectată: {target_month_name}\n\n"
             "Vrei să continui oricum?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            APP_TITLE,
         )
-        return result == QMessageBox.StandardButton.Yes
 
     def _refresh_template_selection(self) -> None:
         values = self.window.form_values()

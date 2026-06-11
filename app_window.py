@@ -6,6 +6,7 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -193,7 +194,156 @@ QProgressBar::chunk {{
     background: {COLOR_PRIMARY};
     border-radius: 4px;
 }}
+QDialog#alertDialog {{
+    background: {COLOR_BG};
+}}
+QFrame#alertPanel {{
+    background: {COLOR_SURFACE};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 8px;
+}}
+QLabel#alertSeverity {{
+    color: {COLOR_MUTED};
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+}}
+QLabel#alertMessage {{
+    color: {COLOR_TEXT};
+    font-size: 13px;
+    font-weight: 700;
+}}
+QPushButton#warningButton {{
+    background: {COLOR_WARNING};
+    border-color: {COLOR_WARNING};
+    color: white;
+}}
+QPushButton#warningButton:hover {{
+    background: #92400E;
+    border-color: #92400E;
+}}
+QPushButton#warningButton:pressed {{
+    background: #78350F;
+    border-color: #78350F;
+}}
+QPushButton#dangerButton {{
+    background: {COLOR_ERROR};
+    border-color: {COLOR_ERROR};
+    color: white;
+}}
+QPushButton#dangerButton:hover {{
+    background: #991B1B;
+    border-color: #991B1B;
+}}
+QPushButton#dangerButton:pressed {{
+    background: #7F1D1D;
+    border-color: #7F1D1D;
+}}
 """
+
+
+class AlertDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        message: str,
+        kind: str,
+        *,
+        confirm: bool = False,
+        title: str = APP_TITLE,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("alertDialog")
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.setStyleSheet(APP_QSS)
+        if parent is not None and not parent.windowIcon().isNull():
+            self.setWindowIcon(parent.windowIcon())
+
+        accent = COLOR_ERROR if kind == "error" else COLOR_WARNING
+        severity = "EROARE" if kind == "error" else "ATENȚIE"
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(0)
+
+        panel = QFrame(objectName="alertPanel")
+        root.addWidget(panel)
+
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(16, 15, 16, 14)
+        panel_layout.setSpacing(14)
+
+        content_row = QHBoxLayout()
+        content_row.setSpacing(12)
+
+        marker = QLabel("!")
+        marker.setAlignment(Qt.AlignCenter)
+        marker.setFixedSize(34, 34)
+        marker.setStyleSheet(
+            f"background: {accent}; color: white; border-radius: 17px; "
+            "font-size: 20px; font-weight: 900;"
+        )
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(5)
+        severity_label = QLabel(severity)
+        severity_label.setObjectName("alertSeverity")
+        message_label = QLabel(message)
+        message_label.setObjectName("alertMessage")
+        message_label.setWordWrap(True)
+        message_label.setTextFormat(Qt.PlainText)
+        message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        message_label.setMinimumWidth(360)
+        message_label.setMaximumWidth(620)
+
+        text_column.addWidget(severity_label)
+        text_column.addWidget(message_label)
+        content_row.addWidget(marker, 0, Qt.AlignTop)
+        content_row.addLayout(text_column, 1)
+        panel_layout.addLayout(content_row)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+
+        if confirm:
+            cancel_button = QPushButton("Anulează")
+            cancel_button.setObjectName("secondaryButton")
+            cancel_button.setMinimumWidth(104)
+            cancel_button.clicked.connect(self.reject)
+            cancel_button.setDefault(True)
+
+            continue_button = QPushButton("Continuă")
+            continue_button.setObjectName("warningButton")
+            continue_button.setMinimumWidth(104)
+            continue_button.clicked.connect(self.accept)
+
+            button_row.addWidget(cancel_button)
+            button_row.addWidget(continue_button)
+        else:
+            close_button = QPushButton("Închide")
+            close_button.setObjectName("dangerButton" if kind == "error" else "warningButton")
+            close_button.setMinimumWidth(104)
+            close_button.clicked.connect(self.accept)
+            close_button.setDefault(True)
+            button_row.addWidget(close_button)
+
+        panel_layout.addLayout(button_row)
+
+
+def show_warning_dialog(parent: QWidget | None, message: str, title: str = APP_TITLE) -> None:
+    AlertDialog(parent, message, "warning", title=title).exec()
+
+
+def show_error_dialog(parent: QWidget | None, message: str, title: str = APP_TITLE) -> None:
+    AlertDialog(parent, message, "error", title=title).exec()
+
+
+def confirm_warning_dialog(parent: QWidget | None, message: str, title: str = APP_TITLE) -> bool:
+    result = AlertDialog(parent, message, "warning", confirm=True, title=title).exec()
+    return result == QDialog.DialogCode.Accepted
 
 
 class MainWindow(QMainWindow):

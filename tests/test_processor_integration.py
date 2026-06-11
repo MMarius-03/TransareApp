@@ -781,6 +781,34 @@ def test_run_fill_validates_source_month_mismatch(tmp_path: Path) -> None:
             template_sheet_name="martie",
         )
     except processor.ProcessorError as exc:
-        assert "Luna din sursă" in str(exc)
+        message = str(exc)
+        assert "aprilie" in message and "martie" in message
     else:
         raise AssertionError("Expected ProcessorError")
+
+
+def test_run_fill_proceeds_with_selected_month_when_detection_fails(tmp_path: Path, monkeypatch) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    output_dir = tmp_path / "output"
+    build_source_workbook(source_path)
+    build_target_workbook(target_path, include_existing_aprilie=True)
+
+    def _detection_fails(*args, **kwargs):
+        raise processor.ProcessorError("Nu am putut detecta luna din fișierul sursă.")
+
+    monkeypatch.setattr(processor, "detect_source_month_from_file", _detection_fails)
+
+    # Even when automatic month detection is broken, the user's explicit month choice
+    # must drive the run instead of aborting.
+    result = processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        output_dir=output_dir,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="aprilie",
+        template_sheet_name="martie",
+    )
+
+    assert result.output_file.exists()
+    assert result.created_sheet_name == "aprilie"

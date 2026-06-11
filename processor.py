@@ -312,12 +312,13 @@ def detect_source_month_from_file(source_path: str | Path) -> TargetMonth | None
     try:
         workbook = load_workbook(source_path, read_only=True, data_only=True)
         sheet = workbook.active
-        for row in range(1, min(sheet.max_row, 8) + 1):
+        max_row = sheet.max_row or 0
+        for row in range(1, min(max_row, 8) + 1):
             month = _parse_month_from_text(sheet.cell(row, 1).value)
             if month is not None:
                 return month
 
-        for row in range(1, min(sheet.max_row, 64) + 1):
+        for row in range(1, min(max_row, 64) + 1):
             parsed_day = parse_full_date(sheet.cell(row, 1).value)
             if parsed_day is not None:
                 return TargetMonth(parsed_day.year, parsed_day.month, MONTH_NAMES[parsed_day.month - 1])
@@ -327,6 +328,13 @@ def detect_source_month_from_file(source_path: str | Path) -> TargetMonth | None
     finally:
         if workbook is not None:
             workbook.close()
+
+
+def _dominant_month_number(parsed_days: dict[date, ParsedDay]) -> int:
+    counts: dict[int, int] = {}
+    for parsed_day in parsed_days:
+        counts[parsed_day.month] = counts.get(parsed_day.month, 0) + 1
+    return max(counts, key=counts.get)
 
 
 def build_target_day_columns(year: int, month: int) -> list[date]:
@@ -392,7 +400,7 @@ def parse_attendance_workbook(
         header_row = header.header_row
         mentiuni_month_number = target_month_number or (month.month_number if month is not None else None)
         entries: list[AttendanceEntry] = []
-        for row in range(header_row + 1, sheet.max_row + 1):
+        for row in range(header_row + 1, (sheet.max_row or header_row) + 1):
             name = _cell_text(sheet.cell(row, header.name_col).value)
             if not name:
                 continue
@@ -598,19 +606,25 @@ def run_fill(
         raise ProcessorError("Luna țintă selectată nu este validă.")
 
     _emit(progress_callback, 5, "Analizez fișierul sursă")
-    source_month = detect_source_month_from_file(source_path)
-    if source_month is not None and source_month.month_name != target_month_name:
-        raise ProcessorError(
-            f"Luna din sursă este {source_month.month_name}, dar ai selectat {target_month_name}."
-        )
-
     warnings: list[str] = []
     parsed_days = parse_source_days(source_path, warnings=warnings)
     if not parsed_days:
         raise ProcessorError("Nu am găsit zile valide în fișierul sursă.")
 
-    year = source_month.year if source_month is not None else min(parsed_days).year
     month_number = MONTH_NAME_TO_NUMBER[target_month_name]
+    # Validate against the months actually present in the parsed dates instead of
+    # re-reading the file for a header. We only stop when the source clearly belongs to
+    # a different month than the one selected; if automatic detection failed entirely we
+    # still proceed with the user's choice.
+    source_month_numbers = {parsed_day.month for parsed_day in parsed_days}
+    if month_number not in source_month_numbers:
+        dominant_month = _dominant_month_number(parsed_days)
+        raise ProcessorError(
+            f"Zilele din sursă sunt din luna {MONTH_NAMES[dominant_month - 1]}, "
+            f"dar ai selectat {target_month_name}."
+        )
+
+    year = min(parsed_days).year
     all_target_days = build_target_day_columns(year, month_number)
     target_days, removed_days = filter_target_days_to_source(all_target_days, parsed_days)
     if not target_days:
@@ -636,17 +650,17 @@ def run_fill(
                 template_sheet_name=template_sheet_name,
             )
 
-        source_layout = get_sheet_layout(build_result.worksheet)
-        source_blocks = detect_sheet_blocks(build_result.worksheet, source_layout)
+        source_blocks = detect_sheet_blocks(build_result.worksheet, None)
+        source_layout = get_sheet_layout(build_result.worksheet, source_blocks)
         template_off_fills = _find_global_off_fills(build_result.worksheet, source_layout, source_blocks)
 
         _emit(progress_callback, 45, "Rearanjez layout-ul pentru luna țintă")
         rebuild_generated_month_layout(build_result.worksheet, target_days)
 
-        layout = get_sheet_layout(build_result.worksheet)
-        blocks = detect_sheet_blocks(build_result.worksheet, layout)
+        blocks = detect_sheet_blocks(build_result.worksheet, None)
         if not blocks:
             raise ProcessorError("Nu am putut detecta blocurile de completare din foaia generată.")
+        layout = get_sheet_layout(build_result.worksheet, blocks)
 
         warnings.extend(build_removed_day_warnings(removed_days))
         differences: list[str] = []
@@ -691,8 +705,8 @@ def run_fill(
                 template_mode=template_mode,
                 fallback_off_fills=template_off_fills,
             )
-            layout = get_sheet_layout(build_result.worksheet)
-            blocks = detect_sheet_blocks(build_result.worksheet, layout)
+            blocks = detect_sheet_blocks(build_result.worksheet, None)
+            layout = get_sheet_layout(build_result.worksheet, blocks)
 
         _emit(progress_callback, 80, "Rescriu formulele de sumar și recalcul")
         rewrite_summary_formulas(build_result.worksheet, layout, blocks, len(target_days))
@@ -857,7 +871,9 @@ def create_sheet_from_previous_sheet(
 
 
 def rebuild_generated_month_layout(worksheet: Worksheet, target_days: list[date]) -> None:
-    layout = get_sheet_layout(worksheet)
+    # Block rows do not move when columns are inserted/deleted, so detect them once.
+    blocks = detect_sheet_blocks(worksheet, None)
+    layout = get_sheet_layout(worksheet, blocks)
     current_day_count = layout.day_end_col - layout.day_start_col + 1
     target_day_count = len(target_days)
     delta = target_day_count - current_day_count
@@ -873,13 +889,17 @@ def rebuild_generated_month_layout(worksheet: Worksheet, target_days: list[date]
     elif delta < 0:
         worksheet.delete_cols(layout.day_start_col + target_day_count, -delta)
 
-    layout = get_sheet_layout(worksheet)
-    blocks = detect_sheet_blocks(worksheet, layout)
+    # Do not re-detect the layout here: freshly inserted columns are still blank,
+    # so get_sheet_layout would stop the day run at the first empty column and place
+    # the summary labels on top of the last day columns. The new geometry is known
+    # exactly from the column math above.
+    day_start_col = layout.day_start_col
+    summary_start_col = day_start_col + target_day_count
     for block in blocks:
         for offset, current_day in enumerate(target_days):
-            worksheet.cell(block.header_row, layout.day_start_col + offset).value = build_sheet_day_header_value(current_day)
+            worksheet.cell(block.header_row, day_start_col + offset).value = build_sheet_day_header_value(current_day)
         for offset, label in enumerate(SUMMARY_LABELS):
-            worksheet.cell(block.header_row, layout.summary_start_col + offset).value = label
+            worksheet.cell(block.header_row, summary_start_col + offset).value = label
 
     worksheet.title = MONTH_NAMES[target_days[0].month - 1]
 
@@ -1450,8 +1470,12 @@ def _is_zero_result_pair(value, transatori) -> bool:
     return isinstance(value, (int, float)) and value == 0 and isinstance(transatori, (int, float)) and transatori == 0
 
 
-def get_sheet_layout(worksheet: Worksheet) -> SheetLayout:
-    blocks = detect_sheet_blocks(worksheet, None)
+def get_sheet_layout(
+    worksheet: Worksheet,
+    blocks: list[SheetBlock] | None = None,
+) -> SheetLayout:
+    if blocks is None:
+        blocks = detect_sheet_blocks(worksheet, None)
     if not blocks:
         raise ProcessorError("Nu am găsit un bloc valid în sheet-ul template.")
 
@@ -1482,7 +1506,8 @@ def get_sheet_layout(worksheet: Worksheet) -> SheetLayout:
 
 def detect_sheet_blocks(worksheet: Worksheet, layout: SheetLayout | None) -> list[SheetBlock]:
     blocks: list[SheetBlock] = []
-    for row in range(1, worksheet.max_row - 1):
+    # Start at row 4 so header_row (row - 3) is always a valid 1-based row.
+    for row in range(4, (worksheet.max_row or 0) - 1):
         if normalize_label(worksheet.cell(row, 2).value) != "vaci pe om":
             continue
         if normalize_label(worksheet.cell(row + 1, 2).value) != "vaci 160 in 14":
@@ -1845,8 +1870,8 @@ def _looks_like_attendance_data_row(row: list[str]) -> bool:
 
 
 def _detect_month_from_sheet(worksheet: Worksheet) -> TargetMonth | None:
-    max_row = min(worksheet.max_row, 12)
-    max_col = min(worksheet.max_column, 8)
+    max_row = min(worksheet.max_row or 0, 12)
+    max_col = min(worksheet.max_column or 0, 8)
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
             month = _parse_month_from_text(worksheet.cell(row, col).value)
@@ -1856,9 +1881,10 @@ def _detect_month_from_sheet(worksheet: Worksheet) -> TargetMonth | None:
 
 
 def _find_attendance_header(worksheet: Worksheet) -> AttendanceHeader | None:
-    for row in range(1, min(worksheet.max_row, 20) + 1):
+    max_col = worksheet.max_column or 0
+    for row in range(1, min(worksheet.max_row or 0, 20) + 1):
         columns_by_label: dict[str, int] = {}
-        for col in range(1, worksheet.max_column + 1):
+        for col in range(1, max_col + 1):
             label = normalize_label(worksheet.cell(row, col).value)
             if label:
                 columns_by_label[label] = col

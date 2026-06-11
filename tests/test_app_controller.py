@@ -263,6 +263,41 @@ def test_start_run_can_continue_after_attendance_month_mismatch(
     assert FakeWorker.last_kwargs["allow_attendance_month_mismatch"] is True
 
 
+def test_start_run_prompts_on_attendance_year_mismatch_with_same_month(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    attendance = tmp_path / "attendance.xlsx"
+    # Same month as target (aprilie) but a different year than the detected source.
+    build_attendance_workbook(attendance, title="TRANŞARE - APRILIE 2025")
+    monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
+    monkeypatch.setattr(app_controller, "QThread", FakeThread)
+    controller.detected_source_year = 2026
+    confirm_calls: list[tuple[str, str]] = []
+
+    def _confirm(attendance_month: str, target_month_name: str) -> bool:
+        confirm_calls.append((attendance_month, target_month_name))
+        return True
+
+    controller._confirm_attendance_month_mismatch = _confirm
+    controller.window.values = {
+        "source_path": str(tmp_path / "source.xlsx"),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": str(attendance),
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+        "output_dir": str(tmp_path / "output"),
+    }
+
+    controller.start_run()
+
+    assert confirm_calls, "Expected the year mismatch to trigger a confirmation prompt"
+    assert FakeWorker.last_kwargs is not None
+    assert FakeWorker.last_kwargs["allow_attendance_month_mismatch"] is True
+
+
 def test_handle_success_updates_output_state(controller: app_controller.AppController, tmp_path: Path) -> None:
     result = FakeResult(
         output_file=tmp_path / "done.xlsx",

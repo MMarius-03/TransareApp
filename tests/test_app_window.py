@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QPushButton
+
 from app_window import (
     APP_TITLE,
+    AlertDialog,
     TEMPLATE_MODE_PREDEFINED_LABEL,
     TEMPLATE_MODE_PREVIOUS_SHEET_LABEL,
     MainWindow,
@@ -51,3 +54,27 @@ def test_main_window_smoke(qapp) -> None:
     assert window.run_button.isEnabled() is True
     assert window.open_button.isEnabled() is True
     window.close()
+
+
+def test_alert_dialog_uses_styled_buttons(qapp) -> None:
+    warning = AlertDialog(None, "Luna selectată nu se potrivește.", "warning", confirm=True)
+    error = AlertDialog(None, "Nu am putut deschide fișierul.", "error")
+
+    warning_buttons = {
+        button.text(): button.objectName()
+        for button in warning.findChildren(QPushButton)
+    }
+    error_buttons = {
+        button.text(): button.objectName()
+        for button in error.findChildren(QPushButton)
+    }
+
+    assert warning.objectName() == "alertDialog"
+    assert warning_buttons == {
+        "Anulează": "secondaryButton",
+        "Continuă": "warningButton",
+    }
+    assert error_buttons == {"Închide": "dangerButton"}
+
+    warning.close()
+    error.close()
