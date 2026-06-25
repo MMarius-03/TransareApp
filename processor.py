@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import math
+import os
 import re
 from copy import copy
 from dataclasses import dataclass, field
@@ -79,6 +80,10 @@ WORKDAY_COUNT_FILL = PatternFill(fill_type="solid", fgColor="C6EFCE")
 
 class ProcessorError(RuntimeError):
     pass
+
+
+class ProcessingCancelled(Exception):
+    """Raised internally when the user cancels a running fill."""
 
 
 @dataclass(frozen=True)
@@ -194,6 +199,7 @@ class RunResult:
     warnings: list[str] = field(default_factory=list)
     differences: list[str] = field(default_factory=list)
     created_sheet_name: str = ""
+    test_sheet_name: str = ""
     template_mode_used: str = ""
     template_source_name: str | None = None
     attendance_summary: AttendanceApplySummary | None = None
@@ -421,6 +427,8 @@ def parse_attendance_workbook(
         return AttendanceWorkbook(month=month, entries=entries)
     except ProcessorError:
         raise
+    except PermissionError as exc:
+        raise _locked_file_error(attendance_path) from exc
     except Exception as exc:
         raise ProcessorError("Nu am putut citi fișierul Transatori+Detinuți.") from exc
     finally:
@@ -579,17 +587,16 @@ def parse_attendance_pdf(
 def run_fill(
     source_path: str | Path,
     target_path: str | Path,
-    output_dir: str | Path,
     template_mode: str,
     target_month_name: str,
     template_sheet_name: str | None = None,
     attendance_path: str | Path | None = None,
     allow_attendance_month_mismatch: bool = False,
     progress_callback: Callable[[ProgressEvent], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> RunResult:
     source_path = Path(source_path)
     target_path = Path(target_path)
-    output_dir = Path(output_dir)
     attendance_path = Path(attendance_path) if attendance_path else None
 
     if not source_path.exists():
@@ -605,6 +612,7 @@ def run_fill(
     if target_month_name not in MONTH_NAME_TO_NUMBER:
         raise ProcessorError("Luna țintă selectată nu este validă.")
 
+    _check_cancel(cancel_check)
     _emit(progress_callback, 5, "Analizez fișierul sursă")
     warnings: list[str] = []
     parsed_days = parse_source_days(source_path, warnings=warnings)
@@ -630,23 +638,28 @@ def run_fill(
     if not target_days:
         raise ProcessorError("Nu am găsit zile lucrătoare valide din luna țintă în fișierul sursă.")
 
+    _check_cancel(cancel_check)
     _emit(progress_callback, 20, "Deschid workbook-ul de salarii")
-    workbook = load_workbook(target_path, data_only=False)
+    try:
+        workbook = load_workbook(target_path, data_only=False)
+    except PermissionError as exc:
+        raise _locked_file_error(target_path) from exc
     template_workbook = None
     try:
+        sheet_name, test_sheet_name = allocate_month_sheet_names(workbook, target_month_name)
         if template_mode == TEMPLATE_MODE_PREDEFINED:
             _emit(progress_callback, 30, "Construiesc foaia nouă din template-ul predefinit")
             template_workbook = load_workbook(PREDEFINED_TEMPLATE_WORKBOOK, data_only=False)
             build_result = create_sheet_from_predefined_template(
                 workbook=workbook,
                 template_workbook=template_workbook,
-                target_sheet_name=target_month_name,
+                target_sheet_name=sheet_name,
             )
         else:
             _emit(progress_callback, 30, "Construiesc foaia nouă din sheet-ul anterior")
             build_result = create_sheet_from_previous_sheet(
                 workbook=workbook,
-                target_sheet_name=target_month_name,
+                target_sheet_name=sheet_name,
                 template_sheet_name=template_sheet_name,
             )
 
@@ -665,6 +678,7 @@ def run_fill(
         warnings.extend(build_removed_day_warnings(removed_days))
         differences: list[str] = []
 
+        _check_cancel(cancel_check)
         _emit(progress_callback, 65, "Completez zilele și media ponderată a transatorilor")
         fill_generated_sheet(
             worksheet=build_result.worksheet,
@@ -679,6 +693,7 @@ def run_fill(
 
         attendance_summary = None
         if attendance_path is not None:
+            _check_cancel(cancel_check)
             _emit(progress_callback, 74, "Aplic CO, N și mențiunile din Transatori+Detinuți")
             attendance_data = parse_attendance_workbook(
                 attendance_path,
@@ -710,23 +725,30 @@ def run_fill(
 
         _emit(progress_callback, 80, "Rescriu formulele de sumar și recalcul")
         rewrite_summary_formulas(build_result.worksheet, layout, blocks, len(target_days))
+        _check_cancel(cancel_check)
+        _emit(progress_callback, 88, "Construiesc foaia pentru teste fără formule")
+        create_formula_free_test_sheet(
+            workbook=workbook,
+            source_worksheet=build_result.worksheet,
+            test_sheet_name=test_sheet_name,
+            target_days=target_days,
+        )
         enable_full_recalculation(workbook)
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_file = unique_output_path(
-            output_dir,
-            f"{target_path.stem} - {target_month_name} completat{target_path.suffix}",
-        )
-
-        _emit(progress_callback, 95, "Salvez workbook-ul final")
-        workbook.save(output_file)
+        _check_cancel(cancel_check)
+        _emit(progress_callback, 95, "Salvez workbook-ul original")
+        try:
+            save_workbook_in_place(workbook, target_path)
+        except PermissionError as exc:
+            raise _locked_file_error(target_path, writing=True) from exc
         return RunResult(
-            output_file=output_file,
+            output_file=target_path,
             mapped_days=len(parsed_days),
             updated_blocks=len(blocks),
             warnings=warnings,
             differences=differences,
-            created_sheet_name=target_month_name,
+            created_sheet_name=sheet_name,
+            test_sheet_name=test_sheet_name,
             template_mode_used=template_mode,
             template_source_name=build_result.template_source_name,
             attendance_summary=attendance_summary,
@@ -746,7 +768,10 @@ def parse_source_days(source_path: str | Path, warnings: list[str] | None = None
     if _is_pdf_path(source_path):
         return parse_source_days_pdf(source_path, warnings=warnings)
 
-    workbook = load_workbook(source_path, data_only=True, read_only=True)
+    try:
+        workbook = load_workbook(source_path, data_only=True, read_only=True)
+    except PermissionError as exc:
+        raise _locked_file_error(source_path) from exc
     sheet = workbook.active
     parsed: dict[date, ParsedDay] = {}
     current_day: date | None = None
@@ -821,7 +846,7 @@ def create_sheet_from_predefined_template(
 ) -> TemplateBuildResult:
     template_sheet = pick_template_sheet(template_workbook)
     if target_sheet_name in workbook.sheetnames:
-        del workbook[target_sheet_name]
+        raise ProcessorError(f"Sheet-ul '{target_sheet_name}' există deja în workbook.")
 
     insert_index = first_month_sheet_index(workbook)
     created = clone_sheet_between_workbooks(
@@ -851,7 +876,7 @@ def create_sheet_from_previous_sheet(
         raise ProcessorError("Sheet-ul template nu poate fi aceeași lună cu foaia care trebuie generată.")
 
     if target_sheet_name in workbook.sheetnames:
-        del workbook[target_sheet_name]
+        raise ProcessorError(f"Sheet-ul '{target_sheet_name}' există deja în workbook.")
 
     source_sheet = workbook[template_sheet_name]
     created = workbook.copy_worksheet(source_sheet)
@@ -900,8 +925,6 @@ def rebuild_generated_month_layout(worksheet: Worksheet, target_days: list[date]
             worksheet.cell(block.header_row, day_start_col + offset).value = build_sheet_day_header_value(current_day)
         for offset, label in enumerate(SUMMARY_LABELS):
             worksheet.cell(block.header_row, summary_start_col + offset).value = label
-
-    worksheet.title = MONTH_NAMES[target_days[0].month - 1]
 
 
 def rewrite_summary_formulas(
@@ -1008,6 +1031,183 @@ def rewrite_summary_formulas(
         worksheet.cell(block.diff_row, zile_in_plus_col).value = (
             f"={get_column_letter(de_platit_col)}{block.diff_row}/175"
         )
+
+
+def allocate_month_sheet_names(workbook: Workbook, month_sheet_name: str) -> tuple[str, str]:
+    existing_names = {normalize_label(name) for name in workbook.sheetnames}
+    counter = 1
+    while True:
+        suffix = "" if counter == 1 else f" ({counter})"
+        sheet_name = f"{month_sheet_name}{suffix}"
+        test_sheet_name = f"{month_sheet_name} pentru teste{suffix}"
+        if normalize_label(sheet_name) not in existing_names and normalize_label(test_sheet_name) not in existing_names:
+            return sheet_name, test_sheet_name
+        counter += 1
+
+
+def create_formula_free_test_sheet(
+    workbook: Workbook,
+    source_worksheet: Worksheet,
+    test_sheet_name: str,
+    target_days: list[date],
+) -> Worksheet:
+    if test_sheet_name in workbook.sheetnames:
+        raise ProcessorError(f"Sheet-ul '{test_sheet_name}' există deja în workbook.")
+
+    test_sheet = workbook.copy_worksheet(source_worksheet)
+    test_sheet.title = test_sheet_name
+
+    source_index = workbook._sheets.index(source_worksheet)
+    workbook._sheets.remove(test_sheet)
+    workbook._sheets.insert(source_index + 1, test_sheet)
+
+    blocks = detect_sheet_blocks(test_sheet, None)
+    layout = get_sheet_layout(test_sheet, blocks)
+    write_static_generated_values(test_sheet, layout, blocks, len(target_days))
+    clear_remaining_formulas(test_sheet)
+    return test_sheet
+
+
+def write_static_generated_values(
+    worksheet: Worksheet,
+    layout: SheetLayout,
+    blocks: list[SheetBlock],
+    workday_count: int,
+) -> None:
+    if not blocks:
+        return
+
+    target_rate_col = layout.summary_start_col + 2
+    target_rate_row = blocks[0].header_row - 1
+    target_rate = _cell_number(worksheet.cell(target_rate_row, target_rate_col).value) or TARGET_RATE_VALUE
+
+    workday_count_col = layout.summary_start_col + 4
+    workday_count_row = blocks[0].header_row - 1
+    worksheet.cell(workday_count_row, workday_count_col).value = workday_count
+
+    for block in blocks:
+        for day_col in range(layout.day_start_col, layout.day_end_col + 1):
+            value_cell = worksheet.cell(block.value_row, day_col)
+            transatori_cell = worksheet.cell(block.transatori_row, day_col)
+            value = _cell_number(value_cell.value)
+            transatori = _cell_number(transatori_cell.value)
+            per_om = value / transatori if transatori > 0 else 0
+            norm = 11.5 if transatori > 0 else 0
+            diff = per_om - norm if transatori > 0 else 0
+
+            value_cell.value = _clean_number(value)
+            transatori_cell.value = _clean_number(transatori)
+            worksheet.cell(block.per_om_row, day_col).value = _clean_number(per_om)
+            worksheet.cell(block.norm_row, day_col).value = _clean_number(norm)
+            worksheet.cell(block.diff_row, day_col).value = _clean_number(diff)
+
+        sum_col = layout.summary_start_col
+        zile_col = sum_col + 1
+        target_col = sum_col + 2
+        de_platit_col = sum_col + 3
+        zile_lucratoare_col = sum_col + 4
+        zile_in_plus_col = sum_col + 5
+        salar_pe_zi_col = sum_col + 6
+        bani_in_plus_col = sum_col + 7
+        salar_baza_col = sum_col + 8
+        total_col = sum_col + 9
+        nume_col = sum_col + 10
+        premium_col = sum_col + 11
+
+        preserved_salar_baza = worksheet.cell(block.value_row, salar_baza_col).value
+        preserved_nume = worksheet.cell(block.value_row, nume_col).value
+        preserved_premium = worksheet.cell(block.value_row, premium_col).value
+        salar_baza = _cell_number(preserved_salar_baza)
+
+        _clear_summary_row(
+            worksheet,
+            block.value_row,
+            sum_col,
+            premium_col,
+            preserve_cols={salar_baza_col, nume_col, premium_col},
+        )
+        for row in (block.per_om_row, block.norm_row, block.diff_row):
+            _clear_summary_row(worksheet, row, sum_col, premium_col)
+
+        value_sum = sum(_cell_number(worksheet.cell(block.value_row, col).value) for col in range(layout.day_start_col, layout.day_end_col + 1))
+        workday_hits = sum(
+            1
+            for col in range(layout.day_start_col, layout.day_end_col + 1)
+            if _cell_number(worksheet.cell(block.transatori_row, col).value) > 0
+        )
+        target_value = workday_hits * target_rate
+        de_platit = value_sum - target_value
+        zile_in_plus = de_platit / 175
+        salar_pe_zi = salar_baza / workday_count if workday_count else 0
+        bani_in_plus = salar_pe_zi * zile_in_plus
+        total = salar_baza + bani_in_plus
+
+        worksheet.cell(block.value_row, sum_col).value = _clean_number(value_sum)
+        worksheet.cell(block.value_row, zile_col).value = workday_hits
+        worksheet.cell(block.value_row, target_col).value = _clean_number(target_value)
+        worksheet.cell(block.value_row, de_platit_col).value = _clean_number(de_platit)
+        worksheet.cell(block.value_row, zile_lucratoare_col).value = workday_count
+        worksheet.cell(block.value_row, zile_in_plus_col).value = _clean_number(zile_in_plus)
+        worksheet.cell(block.value_row, salar_pe_zi_col).value = _clean_number(salar_pe_zi)
+        worksheet.cell(block.value_row, bani_in_plus_col).value = _clean_number(bani_in_plus)
+        worksheet.cell(block.value_row, total_col).value = _clean_number(total)
+        worksheet.cell(block.value_row, salar_baza_col).value = preserved_salar_baza
+        worksheet.cell(block.value_row, premium_col).value = preserved_premium
+        worksheet.cell(block.value_row, nume_col).value = preserved_nume or worksheet.cell(block.value_row, 2).value
+
+        per_om_sum = sum(_cell_number(worksheet.cell(block.per_om_row, col).value) for col in range(layout.day_start_col, layout.day_end_col + 1))
+        norm_sum = sum(_cell_number(worksheet.cell(block.norm_row, col).value) for col in range(layout.day_start_col, layout.day_end_col + 1))
+        diff_sum = sum(_cell_number(worksheet.cell(block.diff_row, col).value) for col in range(layout.day_start_col, layout.day_end_col + 1))
+        cost_per_vaca = salar_pe_zi / 11.5 if salar_pe_zi else 0
+
+        worksheet.cell(block.per_om_row, sum_col).value = _clean_number(per_om_sum)
+        worksheet.cell(block.per_om_row, target_col).value = "cost /vaca"
+        worksheet.cell(block.per_om_row, zile_lucratoare_col).value = _clean_number(cost_per_vaca)
+
+        worksheet.cell(block.norm_row, sum_col).value = _clean_number(norm_sum)
+        worksheet.cell(block.norm_row, target_col).value = "bani  in plus"
+        worksheet.cell(block.norm_row, zile_lucratoare_col).value = _clean_number(diff_sum * cost_per_vaca)
+
+        worksheet.cell(block.diff_row, sum_col).value = _clean_number(diff_sum)
+        worksheet.cell(block.diff_row, zile_in_plus_col).value = 0
+
+
+def clear_remaining_formulas(worksheet: Worksheet) -> None:
+    for row in worksheet.iter_rows():
+        for cell in row:
+            if not (isinstance(cell.value, str) and cell.value.startswith("=")):
+                continue
+            parsed = _parse_simple_numeric_formula(cell.value)
+            cell.value = _clean_number(parsed) if parsed is not None else None
+
+
+def _cell_number(value) -> float:
+    if isinstance(value, str) and value.startswith("="):
+        parsed = _parse_simple_numeric_formula(value)
+        return parsed if parsed is not None else 0.0
+    return as_number(value)
+
+
+def _parse_simple_numeric_formula(value: str) -> float | None:
+    text = value.strip().replace(",", ".")
+    match = re.fullmatch(
+        r"=\s*(-?\d+(?:\.\d+)?)\s*\+\s*(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)\s*",
+        text,
+    )
+    if match is None:
+        return None
+    left = float(match.group(1))
+    numerator = float(match.group(2))
+    denominator = float(match.group(3))
+    if denominator == 0:
+        return 0.0
+    return left + numerator / denominator
+
+
+def _clean_number(value: float):
+    if math.isfinite(value) and abs(value - round(value)) < 1e-9:
+        return int(round(value))
+    return round(value, 10)
 
 
 def _write_target_rate_cell(worksheet: Worksheet, row: int, col: int) -> None:
@@ -1644,18 +1844,26 @@ def is_total_row(value) -> bool:
     return normalize_label(value).startswith("total")
 
 
-def unique_output_path(output_dir: Path, filename: str) -> Path:
-    candidate = output_dir / filename
-    if not candidate.exists():
-        return candidate
+def save_workbook_in_place(workbook: Workbook, target_path: Path) -> None:
+    temp_path = temporary_workbook_path(target_path)
+    try:
+        workbook.save(temp_path)
+        os.replace(temp_path, target_path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
-    stem = candidate.stem
-    suffix = candidate.suffix
-    counter = 2
+
+def temporary_workbook_path(target_path: Path) -> Path:
+    counter = 1
     while True:
-        numbered = output_dir / f"{stem} ({counter}){suffix}"
-        if not numbered.exists():
-            return numbered
+        suffix = "" if counter == 1 else f"-{counter}"
+        candidate = target_path.with_name(f".{target_path.stem}.tmp{suffix}{target_path.suffix}")
+        if not candidate.exists():
+            return candidate
         counter += 1
 
 
@@ -1675,6 +1883,19 @@ def _emit(
 ) -> None:
     if callback is not None:
         callback(ProgressEvent(percent=percent, message=message))
+
+
+def _check_cancel(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise ProcessingCancelled()
+
+
+def _locked_file_error(path: Path, *, writing: bool = False) -> ProcessorError:
+    action = "salva fișierul" if writing else "deschide fișierul"
+    return ProcessorError(
+        f"Nu am putut {action} „{path.name}”. Este deschis în alt program "
+        "(de exemplu Excel) sau nu ai permisiuni de scriere. Închide-l și încearcă din nou."
+    )
 
 
 def _cell_text(value) -> str:

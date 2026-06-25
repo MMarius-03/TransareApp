@@ -18,6 +18,7 @@ from app_window import (
 )
 from processor import (
     MONTH_NAMES,
+    ProcessingCancelled,
     ProcessorError,
     ProgressEvent,
     RunResult,
@@ -39,13 +40,13 @@ class RunWorker(QObject):
     progress = Signal(float, str)
     success = Signal(object)
     error = Signal(str)
+    cancelled = Signal()
     finished = Signal()
 
     def __init__(
         self,
         source_path: str,
         target_path: str,
-        output_dir: str,
         template_mode: str,
         target_month_name: str,
         template_sheet_name: str | None,
@@ -55,26 +56,31 @@ class RunWorker(QObject):
         super().__init__()
         self.source_path = source_path
         self.target_path = target_path
-        self.output_dir = output_dir
         self.template_mode = template_mode
         self.target_month_name = target_month_name
         self.template_sheet_name = template_sheet_name
         self.attendance_path = attendance_path
         self.allow_attendance_month_mismatch = allow_attendance_month_mismatch
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
 
     def run(self) -> None:
         try:
             result = run_fill(
                 source_path=self.source_path,
                 target_path=self.target_path,
-                output_dir=self.output_dir,
                 template_mode=self.template_mode,
                 target_month_name=self.target_month_name,
                 template_sheet_name=self.template_sheet_name,
                 attendance_path=self.attendance_path,
                 allow_attendance_month_mismatch=self.allow_attendance_month_mismatch,
                 progress_callback=self._on_progress,
+                cancel_check=lambda: self._is_cancelled,
             )
+        except ProcessingCancelled:
+            self.cancelled.emit()
         except ProcessorError as exc:
             self.error.emit(str(exc))
         except Exception as exc:
@@ -101,9 +107,6 @@ class AppController(QObject):
         self._connect_window()
 
     def initialize(self) -> None:
-        output_dir = self.base_dir / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self.window.set_output_dir(str(output_dir))
         self.window.set_busy(False, last_output_exists=False)
         self.window.append_log("Aplicația este gata.")
 
@@ -111,8 +114,8 @@ class AppController(QObject):
         self.window.browse_source_requested.connect(self.browse_source_file)
         self.window.browse_target_requested.connect(self.browse_target_file)
         self.window.browse_attendance_requested.connect(self.browse_attendance_file)
-        self.window.browse_output_requested.connect(self.browse_output_dir)
         self.window.run_requested.connect(self.start_run)
+        self.window.cancel_requested.connect(self.cancel_run)
         self.window.open_output_requested.connect(self.open_last_output)
 
     def browse_source_file(self) -> None:
@@ -179,13 +182,6 @@ class AppController(QObject):
             self.window.append_log(f"Transatori+Detinuți selectat: {path}")
             self.window.set_status("Fișierul Transatori+Detinuți a fost selectat.", "info")
 
-    def browse_output_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self.window, "Alege folderul de output")
-        if path:
-            self.window.set_output_dir(path)
-            self.window.append_log(f"Folder output selectat: {path}")
-            self.window.set_status("Folderul de output a fost actualizat.", "info")
-
     def _load_sheet_names(self, workbook_path: str) -> list[str]:
         workbook = None
         try:
@@ -205,7 +201,7 @@ class AppController(QObject):
         values = self.window.form_values()
         missing = [
             key
-            for key in ("source_path", "target_path", "target_month_name", "template_mode_label", "output_dir")
+            for key in ("source_path", "target_path", "target_month_name", "template_mode_label")
             if not values.get(key)
         ]
         if missing:
@@ -273,7 +269,6 @@ class AppController(QObject):
         self._worker = RunWorker(
             source_path=values["source_path"],
             target_path=values["target_path"],
-            output_dir=values["output_dir"],
             template_mode=template_mode,
             target_month_name=values["target_month_name"],
             template_sheet_name=values["template_sheet_name"] or None,
@@ -285,8 +280,26 @@ class AppController(QObject):
         self._worker.progress.connect(self._handle_progress)
         self._worker.success.connect(self._handle_success)
         self._worker.error.connect(self._handle_error)
+        self._worker.cancelled.connect(self._handle_cancelled)
         self._worker.finished.connect(self._cleanup_worker)
         self._thread.start()
+
+    def cancel_run(self) -> None:
+        if self._worker is None:
+            return
+        self._worker.cancel()
+        self.window.set_status("Se anulează procesarea...", "warning")
+        self.window.append_log("Anulare solicitată de utilizator.")
+
+    def shutdown(self) -> None:
+        """Cancel any running worker and wait for the thread to finish (used on close)."""
+        thread = self._thread
+        if thread is None:
+            return
+        if self._worker is not None:
+            self._worker.cancel()
+        thread.quit()
+        thread.wait(10000)
 
     def _handle_progress(self, percent: float, message: str) -> None:
         self.window.set_progress(percent, message)
@@ -297,12 +310,14 @@ class AppController(QObject):
         self.window.set_open_output_enabled(True)
         self.window.set_progress(100, "Completare finalizată")
         self.window.set_status(
-            f"Fișier generat: {result.output_file.name}",
+            f"Workbook actualizat: {result.output_file.name}",
             "success",
         )
-        self.window.append_log(f"Fișier final salvat: {result.output_file}")
+        self.window.append_log(f"Workbook actualizat: {result.output_file}")
         self.window.append_log(
-            f"Foaie creată: {result.created_sheet_name} | template: {result.template_source_name or 'preset'}"
+            "Foi create: "
+            f"{result.created_sheet_name}, {result.test_sheet_name} | "
+            f"template: {result.template_source_name or 'preset'}"
         )
         self.window.append_log(f"Zile mapate: {result.mapped_days}; blocuri actualizate: {result.updated_blocks}")
         attendance_summary = getattr(result, "attendance_summary", None)
@@ -333,6 +348,11 @@ class AppController(QObject):
         self.window.append_log(message)
         self._show_error(message)
 
+    def _handle_cancelled(self) -> None:
+        self.window.set_progress(0, "Anulat")
+        self.window.set_status("Procesarea a fost anulată.", "warning")
+        self.window.append_log("Procesarea a fost anulată.")
+
     def _cleanup_worker(self) -> None:
         thread = self._thread
         worker = self._worker
@@ -357,7 +377,7 @@ class AppController(QObject):
             else:
                 subprocess.run(["xdg-open", str(self.last_output_file)], check=False)
         except Exception as exc:
-            self._show_error(f"Nu am putut deschide fișierul generat: {exc}")
+            self._show_error(f"Nu am putut deschide workbook-ul actualizat: {exc}")
 
     def _show_warning(self, message: str) -> None:
         show_warning_dialog(self.window, message, APP_TITLE)

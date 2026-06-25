@@ -7,6 +7,7 @@ import re
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+import pytest
 
 import processor
 from tests.conftest import (
@@ -38,11 +39,19 @@ def _workday_count_cell(worksheet, layout: processor.SheetLayout):
     return worksheet.cell(blocks[0].header_row - 1, layout.summary_start_col + 4)
 
 
+def _formula_cells(worksheet):
+    return [
+        (cell.coordinate, cell.value)
+        for row in worksheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("=")
+    ]
+
+
 def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path: Path, monkeypatch) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     preset_path = tmp_path / "preset.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_basic_target_workbook(target_path)
     build_predefined_template_workbook(preset_path)
@@ -52,13 +61,14 @@ def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path:
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREDEFINED,
         target_month_name="aprilie",
     )
 
     assert result.output_file.exists()
+    assert result.output_file == target_path
     assert result.created_sheet_name == "aprilie"
+    assert result.test_sheet_name == "aprilie pentru teste"
     assert result.template_source_name == "martie"
     assert result.mapped_days == 5
     assert len(result.warnings) == 1
@@ -66,6 +76,8 @@ def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path:
     assert "13.04.2026" in result.warnings[0]
 
     wb = load_workbook(result.output_file, data_only=False)
+    assert "aprilie" in wb.sheetnames
+    assert "aprilie pentru teste" in wb.sheetnames
     ws = wb["aprilie"]
     layout = processor.get_sheet_layout(ws)
 
@@ -92,13 +104,80 @@ def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path:
     assert workday_count_cell.font.bold is True
     assert workday_count_cell.alignment.horizontal == "center"
     assert wb.sheetnames[0] == "aprilie"
+
+    test_ws = wb["aprilie pentru teste"]
+    test_layout = processor.get_sheet_layout(test_ws)
+    assert _formula_cells(test_ws) == []
+    assert test_ws["D6"].value == 102
+    assert test_ws["D7"].value == 14.67
+    assert test_ws["D8"].value == pytest.approx(102 / 14.67, rel=0, abs=0.0001)
+    assert test_ws.cell(6, test_layout.summary_start_col).value == 614
+    assert test_ws.cell(6, test_layout.summary_start_col + 1).value == 5
+    assert test_ws["D6"].fill.fgColor.rgb == ws["D6"].fill.fgColor.rgb
     wb.close()
+
+
+def test_run_fill_raises_processing_cancelled_when_cancel_requested(tmp_path: Path, monkeypatch) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    preset_path = tmp_path / "preset.xlsx"
+    build_source_workbook(source_path)
+    build_basic_target_workbook(target_path)
+    build_predefined_template_workbook(preset_path)
+    monkeypatch.setattr(processor, "PREDEFINED_TEMPLATE_WORKBOOK", preset_path)
+
+    try:
+        processor.run_fill(
+            source_path=source_path,
+            target_path=target_path,
+            template_mode=processor.TEMPLATE_MODE_PREDEFINED,
+            target_month_name="aprilie",
+            cancel_check=lambda: True,
+        )
+    except processor.ProcessingCancelled:
+        pass
+    else:
+        raise AssertionError("Expected run_fill to raise ProcessingCancelled")
+
+    workbook = load_workbook(target_path, data_only=False)
+    assert "aprilie" not in workbook.sheetnames
+    assert "aprilie pentru teste" not in workbook.sheetnames
+    workbook.close()
+
+
+def test_run_fill_reports_friendly_error_when_target_is_locked(tmp_path: Path, monkeypatch) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    preset_path = tmp_path / "preset.xlsx"
+    build_source_workbook(source_path)
+    build_basic_target_workbook(target_path)
+    build_predefined_template_workbook(preset_path)
+    monkeypatch.setattr(processor, "PREDEFINED_TEMPLATE_WORKBOOK", preset_path)
+
+    def _raise_permission(self, *_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(processor.Workbook, "save", _raise_permission)
+
+    try:
+        processor.run_fill(
+            source_path=source_path,
+            target_path=target_path,
+            template_mode=processor.TEMPLATE_MODE_PREDEFINED,
+            target_month_name="aprilie",
+        )
+    except processor.ProcessorError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected run_fill to raise ProcessorError")
+
+    assert "deschis în alt program" in message
+    assert "salarii.xlsx" in message
 
 
 def test_run_fill_excludes_non_sunday_days_missing_from_source(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     all_april_days = processor.build_target_day_columns(2026, 4)
     source_days = [
         current_day
@@ -111,7 +190,6 @@ def test_run_fill_excludes_non_sunday_days_missing_from_source(tmp_path: Path) -
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -161,7 +239,6 @@ def test_run_fill_excludes_non_sunday_days_missing_from_source(tmp_path: Path) -
 def test_run_fill_previous_sheet_mode_overwrites_stale_global_target_rate(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
 
@@ -177,7 +254,6 @@ def test_run_fill_previous_sheet_mode_overwrites_stale_global_target_rate(tmp_pa
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -200,7 +276,6 @@ def test_run_fill_previous_sheet_mode_overwrites_stale_global_target_rate(tmp_pa
 def test_run_fill_does_not_generate_formula_ranges_that_include_their_own_cell(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     all_april_days = processor.build_target_day_columns(2026, 4)
     source_days = [
         current_day
@@ -213,7 +288,6 @@ def test_run_fill_does_not_generate_formula_ranges_that_include_their_own_cell(t
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -247,7 +321,6 @@ def test_run_fill_ignores_attendance_co_days_removed_from_generated_table(tmp_pa
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     all_april_days = processor.build_target_day_columns(2026, 4)
     source_days = [
         current_day
@@ -264,7 +337,6 @@ def test_run_fill_ignores_attendance_co_days_removed_from_generated_table(tmp_pa
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -295,7 +367,6 @@ def test_run_fill_predefined_mode_colors_zero_result_block_using_global_off_fall
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     preset_path = tmp_path / "preset.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path, zero_days={"02.04.2026"})
     build_basic_target_workbook(target_path)
     build_predefined_template_workbook(preset_path, include_offless_block=True)
@@ -305,7 +376,6 @@ def test_run_fill_predefined_mode_colors_zero_result_block_using_global_off_fall
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREDEFINED,
         target_month_name="aprilie",
     )
@@ -321,44 +391,97 @@ def test_run_fill_predefined_mode_colors_zero_result_block_using_global_off_fall
     workbook.close()
 
 
-def test_run_fill_previous_sheet_mode_recreates_existing_target_and_inserts_before_template(tmp_path: Path) -> None:
+def test_run_fill_previous_sheet_mode_numbers_existing_target_and_inserts_before_template(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path, include_existing_aprilie=True)
 
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
     )
 
     wb = load_workbook(result.output_file, data_only=False)
-    assert wb.sheetnames[:2] == ["aprilie", "martie"]
+    assert result.created_sheet_name == "aprilie (2)"
+    assert result.test_sheet_name == "aprilie pentru teste (2)"
+    assert wb.sheetnames[:3] == ["aprilie (2)", "aprilie pentru teste (2)", "martie"]
+    assert wb["aprilie"]["A1"].value == "stale"
 
-    ws = wb["aprilie"]
+    ws = wb["aprilie (2)"]
     assert ws["A1"].value is None
     assert ws["G12"].value == 6.04
     assert ws["H5"].value == "VACI TRAN "
     assert ws["Q6"].value == "=P6+O6"
+    assert _formula_cells(wb["aprilie pentru teste (2)"]) == []
     wb.close()
+
+
+def test_run_fill_numbers_pair_when_test_sheet_name_exists(tmp_path: Path) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    build_source_workbook(source_path)
+    build_target_workbook(target_path)
+
+    workbook = load_workbook(target_path, data_only=False)
+    workbook.create_sheet("aprilie pentru teste")
+    workbook.save(target_path)
+    workbook.close()
+
+    result = processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="aprilie",
+        template_sheet_name="martie",
+    )
+
+    workbook = load_workbook(result.output_file, data_only=False)
+    assert result.created_sheet_name == "aprilie (2)"
+    assert result.test_sheet_name == "aprilie pentru teste (2)"
+    assert "aprilie" not in workbook.sheetnames
+    assert "aprilie pentru teste" in workbook.sheetnames
+    assert "aprilie (2)" in workbook.sheetnames
+    assert "aprilie pentru teste (2)" in workbook.sheetnames
+    workbook.close()
+
+
+def test_run_fill_creates_month_and_pentru_teste_sheet_names(tmp_path: Path) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    source_days = processor.build_target_day_columns(2026, 5)[:3]
+    build_source_workbook_for_dates(source_path, source_days)
+    build_target_workbook(target_path)
+
+    result = processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="mai",
+        template_sheet_name="martie",
+    )
+
+    workbook = load_workbook(result.output_file, data_only=False)
+    assert result.created_sheet_name == "mai"
+    assert result.test_sheet_name == "mai pentru teste"
+    assert "mai" in workbook.sheetnames
+    assert "mai pentru teste" in workbook.sheetnames
+    assert _formula_cells(workbook["mai pentru teste"]) == []
+    workbook.close()
 
 
 def test_run_fill_previous_sheet_mode_keeps_normal_fill_for_zero_result_blocks(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path, zero_days={"02.04.2026"})
     build_target_workbook(target_path, include_offless_block=True)
 
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -380,7 +503,6 @@ def test_run_fill_with_attendance_applies_co_days_and_mentiuni(tmp_path: Path) -
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
     build_attendance_workbook(
@@ -391,7 +513,6 @@ def test_run_fill_with_attendance_applies_co_days_and_mentiuni(tmp_path: Path) -
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -427,7 +548,6 @@ def test_run_fill_with_attendance_applies_n_days_like_co(tmp_path: Path) -> None
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     source_days = [
         date(2026, 4, 1),
         date(2026, 4, 2),
@@ -445,7 +565,6 @@ def test_run_fill_with_attendance_applies_n_days_like_co(tmp_path: Path) -> None
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -478,7 +597,6 @@ def test_run_fill_accepts_pdf_source_and_pdf_attendance(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.pdf"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.pdf"
-    output_dir = tmp_path / "output"
     build_source_pdf(source_path)
     build_target_workbook(target_path)
     build_attendance_pdf(
@@ -489,7 +607,6 @@ def test_run_fill_accepts_pdf_source_and_pdf_attendance(tmp_path: Path) -> None:
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -514,7 +631,6 @@ def test_run_fill_with_attendance_colors_mentiuni_day_pale_yellow_without_changi
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     source_days = [
         date(2026, 4, 1),
         date(2026, 4, 2),
@@ -533,7 +649,6 @@ def test_run_fill_with_attendance_colors_mentiuni_day_pale_yellow_without_changi
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -568,7 +683,6 @@ def test_run_fill_with_attendance_keeps_co_fill_when_co_and_mentiuni_overlap(tmp
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     source_days = [
         date(2026, 4, 1),
         date(2026, 4, 2),
@@ -587,7 +701,6 @@ def test_run_fill_with_attendance_keeps_co_fill_when_co_and_mentiuni_overlap(tmp
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -614,7 +727,6 @@ def test_run_fill_with_attendance_inserts_mentiuni_when_neighbor_column_is_not_b
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
     build_attendance_workbook(attendance_path)
@@ -630,7 +742,6 @@ def test_run_fill_with_attendance_inserts_mentiuni_when_neighbor_column_is_not_b
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -650,7 +761,6 @@ def test_run_fill_with_attendance_uses_approximate_matching_and_logs_unmatched(t
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
 
@@ -671,7 +781,6 @@ def test_run_fill_with_attendance_uses_approximate_matching_and_logs_unmatched(t
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -694,7 +803,6 @@ def test_run_fill_with_attendance_logs_ambiguous_names(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
 
@@ -713,7 +821,6 @@ def test_run_fill_with_attendance_logs_ambiguous_names(tmp_path: Path) -> None:
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -730,7 +837,6 @@ def test_run_fill_with_attendance_month_mismatch_blocks_by_default_and_can_conti
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
     build_attendance_workbook(attendance_path, title="TRANŞARE - MARTIE 2026")
@@ -739,7 +845,6 @@ def test_run_fill_with_attendance_month_mismatch_blocks_by_default_and_can_conti
         processor.run_fill(
             source_path=source_path,
             target_path=target_path,
-            output_dir=output_dir,
             template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
             target_month_name="aprilie",
             template_sheet_name="martie",
@@ -753,7 +858,6 @@ def test_run_fill_with_attendance_month_mismatch_blocks_by_default_and_can_conti
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
@@ -767,7 +871,6 @@ def test_run_fill_with_attendance_month_mismatch_blocks_by_default_and_can_conti
 def test_run_fill_validates_source_month_mismatch(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
 
@@ -775,7 +878,6 @@ def test_run_fill_validates_source_month_mismatch(tmp_path: Path) -> None:
         processor.run_fill(
             source_path=source_path,
             target_path=target_path,
-            output_dir=output_dir,
             template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
             target_month_name="martie",
             template_sheet_name="martie",
@@ -790,7 +892,6 @@ def test_run_fill_validates_source_month_mismatch(tmp_path: Path) -> None:
 def test_run_fill_proceeds_with_selected_month_when_detection_fails(tmp_path: Path, monkeypatch) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
-    output_dir = tmp_path / "output"
     build_source_workbook(source_path)
     build_target_workbook(target_path, include_existing_aprilie=True)
 
@@ -804,11 +905,11 @@ def test_run_fill_proceeds_with_selected_month_when_detection_fails(tmp_path: Pa
     result = processor.run_fill(
         source_path=source_path,
         target_path=target_path,
-        output_dir=output_dir,
         template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
         target_month_name="aprilie",
         template_sheet_name="martie",
     )
 
     assert result.output_file.exists()
-    assert result.created_sheet_name == "aprilie"
+    assert result.created_sheet_name == "aprilie (2)"
+    assert result.test_sheet_name == "aprilie pentru teste (2)"

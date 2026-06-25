@@ -350,8 +350,8 @@ class MainWindow(QMainWindow):
     browse_source_requested = Signal()
     browse_target_requested = Signal()
     browse_attendance_requested = Signal()
-    browse_output_requested = Signal()
     run_requested = Signal()
+    cancel_requested = Signal()
     open_output_requested = Signal()
 
     def __init__(self) -> None:
@@ -401,7 +401,6 @@ class MainWindow(QMainWindow):
         self.source_path_edit = self._make_path_edit("Fișier sursă cu situația pe zile")
         self.target_path_edit = self._make_path_edit("Workbook salarii existent")
         self.attendance_path_edit = self._make_path_edit("Fișier Transatori+Detinuți pentru CO și mențiuni (opțional)")
-        self.output_dir_edit = self._make_path_edit("Folder unde se salvează workbook-ul generat")
         self.target_month_combo = QComboBox()
         self.target_month_combo.addItems(MONTH_OPTIONS)
         self._configure_combo(self.target_month_combo)
@@ -412,16 +411,13 @@ class MainWindow(QMainWindow):
         self._configure_combo(self.template_mode_combo)
         self.template_sheet_combo = QComboBox()
         self._configure_combo(self.template_sheet_combo)
-        self.sheet_combo = self.template_sheet_combo
 
         self.source_button = self._make_browse_button()
         self.target_button = self._make_browse_button()
         self.attendance_button = self._make_browse_button()
-        self.output_button = self._make_browse_button()
         self.source_button.clicked.connect(self.browse_source_requested.emit)
         self.target_button.clicked.connect(self.browse_target_requested.emit)
         self.attendance_button.clicked.connect(self.browse_attendance_requested.emit)
-        self.output_button.clicked.connect(self.browse_output_requested.emit)
 
         files_title = self._make_section_title("Fișiere", "file")
         settings_title = self._make_section_title("Setări", "settings")
@@ -430,20 +426,18 @@ class MainWindow(QMainWindow):
         self._add_row(form_layout, 1, "Situație", self.source_path_edit, self.source_button)
         self._add_row(form_layout, 2, "Salarii", self.target_path_edit, self.target_button)
         self._add_row(form_layout, 3, "Transatori+Detinuți (opțional)", self.attendance_path_edit, self.attendance_button)
-        self._add_row(form_layout, 4, "Output", self.output_dir_edit, self.output_button)
-        form_layout.addWidget(settings_title, 5, 0, 1, 3)
-        self._add_row(form_layout, 6, "Lună", self.target_month_combo, None)
-        self._add_row(form_layout, 7, "Template", self.template_mode_combo, None)
+        form_layout.addWidget(settings_title, 4, 0, 1, 3)
+        self._add_row(form_layout, 5, "Lună", self.target_month_combo, None)
+        self._add_row(form_layout, 6, "Template", self.template_mode_combo, None)
         self.template_sheet_label = QLabel("Sheet template")
         self.template_sheet_label.setObjectName("fieldLabel")
-        form_layout.addWidget(self.template_sheet_label, 8, 0)
-        form_layout.addWidget(self.template_sheet_combo, 8, 1, 1, 2)
+        form_layout.addWidget(self.template_sheet_label, 7, 0)
+        form_layout.addWidget(self.template_sheet_combo, 7, 1, 1, 2)
         outer.addWidget(form_panel)
 
         self.source_path_edit.textChanged.connect(self._sync_ready_state)
         self.target_path_edit.textChanged.connect(self._sync_ready_state)
         self.attendance_path_edit.textChanged.connect(self._sync_ready_state)
-        self.output_dir_edit.textChanged.connect(self._sync_ready_state)
         self.target_month_combo.currentTextChanged.connect(self._sync_ready_state)
         self.template_sheet_combo.currentTextChanged.connect(self._sync_ready_state)
         self.template_mode_combo.currentTextChanged.connect(self._sync_template_sheet_state)
@@ -475,10 +469,16 @@ class MainWindow(QMainWindow):
         self.open_button = self._make_action_button("Deschide", "external-link", primary=False)
         self.open_button.setObjectName("secondaryButton")
         self.open_button.setEnabled(False)
+        self.cancel_button = QPushButton("Anulează")
+        self.cancel_button.setObjectName("warningButton")
+        self.cancel_button.setMinimumWidth(108)
+        self.cancel_button.setEnabled(False)
         self.run_button.clicked.connect(self.run_requested.emit)
         self.open_button.clicked.connect(self.open_output_requested.emit)
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
         buttons.addWidget(self.run_button)
         buttons.addWidget(self.open_button)
+        buttons.addWidget(self.cancel_button)
         buttons.addStretch(1)
 
         actions_layout.addLayout(status_row)
@@ -573,7 +573,6 @@ class MainWindow(QMainWindow):
             "target_month_name": self.target_month_combo.currentText().strip(),
             "template_mode_label": self.template_mode_combo.currentText().strip(),
             "template_sheet_name": self.template_sheet_combo.currentText().strip(),
-            "output_dir": self.output_dir_edit.text().strip(),
         }
 
     def set_source_path(self, path: str) -> None:
@@ -588,10 +587,6 @@ class MainWindow(QMainWindow):
         self.attendance_path_edit.setText(path)
         self._sync_ready_state()
 
-    def set_output_dir(self, path: str) -> None:
-        self.output_dir_edit.setText(path)
-        self._sync_ready_state()
-
     def set_template_sheet_options(self, sheet_names: list[str], selected: str = "") -> None:
         self.template_sheet_combo.clear()
         self.template_sheet_combo.addItems(sheet_names)
@@ -600,9 +595,6 @@ class MainWindow(QMainWindow):
         elif sheet_names:
             self.template_sheet_combo.setCurrentIndex(0)
         self._sync_ready_state()
-
-    def set_sheet_options(self, sheet_names: list[str], selected: str = "") -> None:
-        self.set_template_sheet_options(sheet_names, selected)
 
     def set_target_month(self, month_name: str) -> None:
         if month_name and month_name in MONTH_OPTIONS:
@@ -626,7 +618,7 @@ class MainWindow(QMainWindow):
         )
         required_ok = all(
             values[key]
-            for key in ("source_path", "target_path", "target_month_name", "output_dir")
+            for key in ("source_path", "target_path", "target_month_name")
         )
         if needs_template_sheet:
             required_ok = required_ok and bool(values["template_sheet_name"])
@@ -679,11 +671,11 @@ class MainWindow(QMainWindow):
     def set_busy(self, is_busy: bool, last_output_exists: bool = False) -> None:
         self._is_busy = is_busy
         self._last_output_exists = last_output_exists
+        self.cancel_button.setEnabled(is_busy)
         for control in (
             self.source_path_edit,
             self.target_path_edit,
             self.attendance_path_edit,
-            self.output_dir_edit,
             self.target_month_combo,
             self.template_mode_combo,
             self.template_sheet_combo,
@@ -694,3 +686,19 @@ class MainWindow(QMainWindow):
     def set_open_output_enabled(self, enabled: bool) -> None:
         self._last_output_exists = enabled
         self.open_button.setEnabled((not self._is_busy) and enabled)
+
+    def closeEvent(self, event) -> None:
+        if self._is_busy:
+            keep_open = not confirm_warning_dialog(
+                self,
+                "Procesarea este încă în curs. Dacă închizi acum, workbook-ul nu va fi actualizat.\n\n"
+                "Sigur vrei să închizi aplicația?",
+                APP_TITLE,
+            )
+            if keep_open:
+                event.ignore()
+                return
+            controller = getattr(self, "_controller", None)
+            if controller is not None and hasattr(controller, "shutdown"):
+                controller.shutdown()
+        event.accept()

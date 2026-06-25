@@ -43,7 +43,6 @@ def test_main_window_smoke(qapp) -> None:
     window.set_source_path("source.xlsx")
     window.set_target_path("target.xlsx")
     window.set_attendance_path("transatori_detinuti.xlsx")
-    window.set_output_dir("output")
     assert window.form_values()["attendance_path"] == "transatori_detinuti.xlsx"
     assert window.run_button.isEnabled() is True
 

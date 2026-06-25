@@ -24,8 +24,8 @@ class FakeWindow:
         self.browse_source_requested = DummySignal()
         self.browse_target_requested = DummySignal()
         self.browse_attendance_requested = DummySignal()
-        self.browse_output_requested = DummySignal()
         self.run_requested = DummySignal()
+        self.cancel_requested = DummySignal()
         self.open_output_requested = DummySignal()
         self.values = {
             "source_path": "",
@@ -34,7 +34,6 @@ class FakeWindow:
             "target_month_name": "ianuarie",
             "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
             "template_sheet_name": "",
-            "output_dir": "",
         }
         self.status_calls: list[tuple[str, str]] = []
         self.log_messages: list[str] = []
@@ -53,9 +52,6 @@ class FakeWindow:
 
     def set_attendance_path(self, path: str) -> None:
         self.values["attendance_path"] = path
-
-    def set_output_dir(self, path: str) -> None:
-        self.values["output_dir"] = path
 
     def set_target_month(self, month_name: str) -> None:
         self.values["target_month_name"] = month_name
@@ -86,6 +82,7 @@ class FakeWindow:
 class FakeResult:
     output_file: Path
     created_sheet_name: str = "aprilie"
+    test_sheet_name: str = "aprilie pentru teste"
     template_source_name: str | None = "martie"
     mapped_days: int = 5
     updated_blocks: int = 2
@@ -101,7 +98,12 @@ class FakeWorker:
         self.progress = DummySignal()
         self.success = DummySignal()
         self.error = DummySignal()
+        self.cancelled = DummySignal()
         self.finished = DummySignal()
+        self.cancel_count = 0
+
+    def cancel(self) -> None:
+        self.cancel_count += 1
 
     def moveToThread(self, _thread) -> None:
         return None
@@ -140,9 +142,8 @@ def controller(tmp_path: Path) -> app_controller.AppController:
     return ctrl
 
 
-def test_initialize_sets_default_output_folder(controller: app_controller.AppController, tmp_path: Path) -> None:
+def test_initialize_sets_ready_state(controller: app_controller.AppController) -> None:
     controller.initialize()
-    assert controller.window.values["output_dir"] == str(tmp_path / "output")
     assert controller.window.busy_calls[-1] == (False, False)
 
 
@@ -199,7 +200,6 @@ def test_start_run_requires_template_sheet_in_previous_mode(controller: app_cont
         "target_month_name": "aprilie",
         "template_mode_label": TEMPLATE_MODE_PREVIOUS_SHEET_LABEL,
         "template_sheet_name": "",
-        "output_dir": str(tmp_path / "output"),
     }
 
     controller.start_run()
@@ -217,7 +217,6 @@ def test_start_run_creates_worker_with_new_contract(controller: app_controller.A
         "target_month_name": "aprilie",
         "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
         "template_sheet_name": "martie",
-        "output_dir": str(tmp_path / "output"),
     }
 
     controller.start_run()
@@ -227,7 +226,6 @@ def test_start_run_creates_worker_with_new_contract(controller: app_controller.A
     assert FakeWorker.last_kwargs == {
         "source_path": str(tmp_path / "source.xlsx"),
         "target_path": str(tmp_path / "target.xlsx"),
-        "output_dir": str(tmp_path / "output"),
         "template_mode": app_controller.TEMPLATE_MODE_PREDEFINED,
         "target_month_name": "aprilie",
         "template_sheet_name": "martie",
@@ -253,7 +251,6 @@ def test_start_run_can_continue_after_attendance_month_mismatch(
         "target_month_name": "aprilie",
         "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
         "template_sheet_name": "martie",
-        "output_dir": str(tmp_path / "output"),
     }
 
     controller.start_run()
@@ -288,7 +285,6 @@ def test_start_run_prompts_on_attendance_year_mismatch_with_same_month(
         "target_month_name": "aprilie",
         "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
         "template_sheet_name": "martie",
-        "output_dir": str(tmp_path / "output"),
     }
 
     controller.start_run()
@@ -296,6 +292,41 @@ def test_start_run_prompts_on_attendance_year_mismatch_with_same_month(
     assert confirm_calls, "Expected the year mismatch to trigger a confirmation prompt"
     assert FakeWorker.last_kwargs is not None
     assert FakeWorker.last_kwargs["allow_attendance_month_mismatch"] is True
+
+
+def test_cancel_run_requests_worker_cancellation(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
+    monkeypatch.setattr(app_controller, "QThread", FakeThread)
+    controller.window.values = {
+        "source_path": str(tmp_path / "source.xlsx"),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+    controller.start_run()
+
+    controller.cancel_run()
+
+    assert controller._worker.cancel_count == 1
+    assert controller.window.status_calls[-1] == ("Se anulează procesarea...", "warning")
+
+
+def test_cancel_run_without_active_worker_is_safe(controller: app_controller.AppController) -> None:
+    # No worker started; must not raise.
+    controller.cancel_run()
+
+
+def test_handle_cancelled_resets_progress(controller: app_controller.AppController) -> None:
+    controller._handle_cancelled()
+
+    assert controller.window.progress_calls[-1] == (0, "Anulat")
+    assert controller.window.status_calls[-1] == ("Procesarea a fost anulată.", "warning")
 
 
 def test_handle_success_updates_output_state(controller: app_controller.AppController, tmp_path: Path) -> None:

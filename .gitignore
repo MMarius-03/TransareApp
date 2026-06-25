@@ -12,6 +12,9 @@ build/
 dist/
 output/
 
+# Real personnel/attendance data — never commit (template in assets/ stays tracked)
+1. TRANSATORI+ DETINUTI 2026.xlsx
+
 .idea/
 .vscode/
 .claude/
