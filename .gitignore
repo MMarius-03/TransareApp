@@ -12,8 +12,8 @@ build/
 dist/
 output/
 
-# Real personnel/attendance data — never commit (template in assets/ stays tracked)
-1. TRANSATORI+ DETINUTI 2026.xlsx
+# Example Excel files are tracked intentionally for local/manual runs.
+# Generated reports remain ignored through output/.
 
 .idea/
 .vscode/

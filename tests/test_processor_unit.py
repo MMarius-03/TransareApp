@@ -68,6 +68,28 @@ def test_detect_source_month_from_file_reads_title(tmp_path: Path) -> None:
     assert detected.year == 2026
 
 
+def test_detect_attendance_month_prefers_explicit_interval_over_banner_title(tmp_path: Path) -> None:
+    attendance_path = tmp_path / "transatori_detinuti.xlsx"
+    build_attendance_workbook(attendance_path, title="TRANŞARE - IULIE 2026")
+
+    detected = processor.detect_attendance_month_from_file(attendance_path)
+
+    assert detected is not None
+    assert detected.month_name == "aprilie"
+    assert detected.year == 2026
+
+
+def test_detect_attendance_pdf_month_prefers_explicit_interval_over_banner_title(tmp_path: Path) -> None:
+    attendance_path = tmp_path / "transatori_detinuti.pdf"
+    build_attendance_pdf(attendance_path, title="TRANSARE - IULIE 2026")
+
+    detected = processor.detect_attendance_month_from_file(attendance_path)
+
+    assert detected is not None
+    assert detected.month_name == "aprilie"
+    assert detected.year == 2026
+
+
 def test_build_target_day_columns_excludes_only_sundays_and_keeps_holidays() -> None:
     days = processor.build_target_day_columns(2026, 4)
 
@@ -76,7 +98,7 @@ def test_build_target_day_columns_excludes_only_sundays_and_keeps_holidays() -> 
     assert date(2026, 4, 13) in days
 
 
-def test_filter_target_days_to_source_removes_missing_non_sundays() -> None:
+def test_filter_target_days_to_source_keeps_all_and_reports_missing_non_sundays() -> None:
     target_days = processor.build_target_day_columns(2026, 4)
     parsed_days = {
         current_day: object()
@@ -84,10 +106,32 @@ def test_filter_target_days_to_source_removes_missing_non_sundays() -> None:
         if current_day not in {date(2026, 4, 11), date(2026, 4, 13)}
     }
 
-    included, removed = processor.filter_target_days_to_source(target_days, parsed_days)
+    included, missing = processor.filter_target_days_to_source(target_days, parsed_days)
 
-    assert len(included) == 24
-    assert removed == [date(2026, 4, 11), date(2026, 4, 13)]
+    # All target-month workdays are preserved; missing days will be highlighted yellow.
+    assert included == list(target_days)
+    assert missing == [date(2026, 4, 11), date(2026, 4, 13)]
+
+
+def test_find_and_treat_source_date_month_mismatches_as_target_days() -> None:
+    source_date = date(2026, 3, 7)
+    target_date = date(2026, 4, 7)
+    parsed_day = processor.ParsedDay(
+        day=source_date,
+        bovine_count=120,
+        ovine_count=0,
+        value=120,
+        transatori_average=15,
+    )
+    parsed_days = {source_date: parsed_day}
+
+    mismatches = processor.find_source_date_month_mismatches(parsed_days, 2026, 4)
+
+    assert mismatches == [processor.SourceDateMonthMismatch(source_date, target_date)]
+    assert processor.treat_source_date_month_mismatches_as_target_days(parsed_days, 2026, 4) == mismatches
+    assert source_date not in parsed_days
+    assert parsed_days[target_date].day == target_date
+    assert parsed_days[target_date].value == 120
 
 
 def test_build_block_fill_profiles_uses_global_off_fallback_for_blocks_without_local_zero_sample(
@@ -181,6 +225,20 @@ def test_parse_attendance_workbook_reads_month_co_and_mentiuni(tmp_path: Path) -
     assert parsed.entries[0].mentiuni == "07.04 - a plecat la 15:00"
 
 
+def test_parse_attendance_workbook_reads_cm_days(tmp_path: Path) -> None:
+    attendance_path = tmp_path / "transatori_detinuti.xlsx"
+    build_attendance_workbook(
+        attendance_path,
+        rows=[("CIOCLEA IOAN", "02", "03", "04,05", "06.04 - observatie")],
+    )
+
+    parsed = processor.parse_attendance_workbook(attendance_path)
+
+    assert parsed.entries[0].co_days == (2,)
+    assert parsed.entries[0].n_days == (3,)
+    assert parsed.entries[0].cm_days == (4, 5)
+
+
 def test_parse_source_pdf_reads_month_and_days(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.pdf"
     build_source_pdf(source_path)
@@ -195,11 +253,11 @@ def test_parse_source_pdf_reads_month_and_days(tmp_path: Path) -> None:
     assert parsed[date(2026, 4, 2)].transatori_average == pytest.approx(14.67, rel=0, abs=0.01)
 
 
-def test_parse_attendance_pdf_reads_co_n_and_mentiuni(tmp_path: Path) -> None:
+def test_parse_attendance_pdf_reads_co_n_cm_and_mentiuni(tmp_path: Path) -> None:
     attendance_path = tmp_path / "transatori_detinuti.pdf"
     build_attendance_pdf(
         attendance_path,
-        rows=[("CIOCLEA IOAN", "02,06", "03,04", "04.04 - observatie")],
+        rows=[("CIOCLEA IOAN", "02,06", "03,04", "05", "04.04 - observatie")],
     )
 
     parsed = processor.parse_attendance_workbook(attendance_path)
@@ -209,5 +267,6 @@ def test_parse_attendance_pdf_reads_co_n_and_mentiuni(tmp_path: Path) -> None:
     assert parsed.entries[0].name == "CIOCLEA IOAN"
     assert parsed.entries[0].co_days == (2, 6)
     assert parsed.entries[0].n_days == (3, 4)
+    assert parsed.entries[0].cm_days == (5,)
     assert parsed.entries[0].mentiuni_days == (4,)
     assert parsed.entries[0].mentiuni == "04.04 - observatie"

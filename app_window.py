@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from runtime_paths import resource_path
 
 APP_TITLE = "TransareApp"
+MISSING_DAYS_EXCLUDE_RESULT = 2
 MONTH_OPTIONS = [
     "ianuarie",
     "februarie",
@@ -250,6 +251,7 @@ class AlertDialog(QDialog):
         kind: str,
         *,
         confirm: bool = False,
+        three_way_choice_labels: tuple[str, str] | None = None,
         title: str = APP_TITLE,
     ) -> None:
         super().__init__(parent)
@@ -308,7 +310,26 @@ class AlertDialog(QDialog):
         button_row.setSpacing(8)
         button_row.addStretch(1)
 
-        if confirm:
+        if three_way_choice_labels is not None:
+            cancel_button = QPushButton("Oprește procesarea")
+            cancel_button.setObjectName("secondaryButton")
+            cancel_button.setMinimumWidth(148)
+            cancel_button.clicked.connect(self.reject)
+
+            secondary_button = QPushButton(three_way_choice_labels[0])
+            secondary_button.setObjectName("secondaryButton")
+            secondary_button.setMinimumWidth(124)
+            secondary_button.clicked.connect(lambda: self.done(MISSING_DAYS_EXCLUDE_RESULT))
+
+            primary_button = QPushButton(three_way_choice_labels[1])
+            primary_button.setObjectName("warningButton")
+            primary_button.setMinimumWidth(124)
+            primary_button.clicked.connect(self.accept)
+
+            button_row.addWidget(cancel_button)
+            button_row.addWidget(secondary_button)
+            button_row.addWidget(primary_button)
+        elif confirm:
             cancel_button = QPushButton("Anulează")
             cancel_button.setObjectName("secondaryButton")
             cancel_button.setMinimumWidth(104)
@@ -344,6 +365,53 @@ def show_error_dialog(parent: QWidget | None, message: str, title: str = APP_TIT
 def confirm_warning_dialog(parent: QWidget | None, message: str, title: str = APP_TITLE) -> bool:
     result = AlertDialog(parent, message, "warning", confirm=True, title=title).exec()
     return result == QDialog.DialogCode.Accepted
+
+
+def choose_missing_source_days_dialog(
+    parent: QWidget | None,
+    message: str,
+    title: str = APP_TITLE,
+) -> bool | None:
+    """Choose whether source-missing days should be added as zero-value columns.
+
+    ``True`` adds the columns, ``False`` excludes them, and ``None`` cancels the run.
+    """
+    result = AlertDialog(
+        parent,
+        message,
+        "warning",
+        three_way_choice_labels=("Nu le adăuga", "Adaugă cu 0"),
+        title=title,
+    ).exec()
+    if result == QDialog.DialogCode.Accepted:
+        return True
+    if result == MISSING_DAYS_EXCLUDE_RESULT:
+        return False
+    return None
+
+
+def choose_mismatched_source_dates_dialog(
+    parent: QWidget | None,
+    message: str,
+    title: str = APP_TITLE,
+) -> bool | None:
+    """Choose whether dates from another month should be treated as the selected month.
+
+    ``True`` reassigns them only in the generated report, ``False`` preserves the
+    source dates, and ``None`` cancels the run.
+    """
+    result = AlertDialog(
+        parent,
+        message,
+        "warning",
+        three_way_choice_labels=("Păstrează datele", "Tratează ca luna aleasă"),
+        title=title,
+    ).exec()
+    if result == QDialog.DialogCode.Accepted:
+        return True
+    if result == MISSING_DAYS_EXCLUDE_RESULT:
+        return False
+    return None
 
 
 class MainWindow(QMainWindow):

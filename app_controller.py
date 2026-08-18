@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from datetime import date
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -12,6 +13,8 @@ from app_window import (
     APP_TITLE,
     TEMPLATE_MODE_PREDEFINED_LABEL,
     TEMPLATE_MODE_PREVIOUS_SHEET_LABEL,
+    choose_missing_source_days_dialog,
+    choose_mismatched_source_dates_dialog,
     confirm_warning_dialog,
     show_error_dialog,
     show_warning_dialog,
@@ -24,9 +27,13 @@ from processor import (
     RunResult,
     TEMPLATE_MODE_PREDEFINED,
     TEMPLATE_MODE_PREVIOUS_SHEET,
+    build_target_day_columns,
     detect_attendance_month_from_file,
     detect_source_month_from_file,
+    filter_target_days_to_source,
+    find_source_date_month_mismatches,
     normalize_label,
+    parse_source_days,
     run_fill,
 )
 
@@ -52,6 +59,8 @@ class RunWorker(QObject):
         template_sheet_name: str | None,
         attendance_path: str | None,
         allow_attendance_month_mismatch: bool,
+        include_missing_source_days: bool,
+        treat_mismatched_source_dates_as_target: bool,
     ) -> None:
         super().__init__()
         self.source_path = source_path
@@ -61,6 +70,8 @@ class RunWorker(QObject):
         self.template_sheet_name = template_sheet_name
         self.attendance_path = attendance_path
         self.allow_attendance_month_mismatch = allow_attendance_month_mismatch
+        self.include_missing_source_days = include_missing_source_days
+        self.treat_mismatched_source_dates_as_target = treat_mismatched_source_dates_as_target
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -76,6 +87,8 @@ class RunWorker(QObject):
                 template_sheet_name=self.template_sheet_name,
                 attendance_path=self.attendance_path,
                 allow_attendance_month_mismatch=self.allow_attendance_month_mismatch,
+                include_missing_source_days=self.include_missing_source_days,
+                treat_mismatched_source_dates_as_target=self.treat_mismatched_source_dates_as_target,
                 progress_callback=self._on_progress,
                 cancel_check=lambda: self._is_cancelled,
             )
@@ -123,7 +136,7 @@ class AppController(QObject):
             self.window,
             "Alege situația transatori",
             "",
-            "Fișiere Excel sau PDF (*.xlsx *.pdf)",
+            "Fișiere Excel sau PDF (*.xlsx *.pdf);;Fișiere Excel (*.xlsx);;Fișiere PDF (*.pdf);;Toate fișierele (*)",
         )
         if path:
             self.window.set_source_path(path)
@@ -175,7 +188,7 @@ class AppController(QObject):
             self.window,
             "Alege fișierul Transatori+Detinuți",
             "",
-            "Fișiere Excel sau PDF (*.xlsx *.pdf)",
+            "Fișiere Excel sau PDF (*.xlsx *.pdf);;Fișiere Excel (*.xlsx);;Fișiere PDF (*.pdf);;Toate fișierele (*)",
         )
         if path:
             self.window.set_attendance_path(path)
@@ -221,6 +234,60 @@ class AppController(QObject):
                 f"Luna detectată în sursă este {self.detected_source_month_name}, nu {values['target_month_name']}."
             )
             return
+
+        parsed_source_days, source_target_year = self._load_source_days_for_target_month(
+            values["source_path"],
+            values["target_month_name"],
+        )
+        treat_mismatched_source_dates_as_target = False
+        mismatched_source_dates = self._find_source_date_month_mismatches(
+            parsed_source_days,
+            source_target_year,
+            values["target_month_name"],
+        )
+        if mismatched_source_dates:
+            treat_mismatched_source_dates_as_target = self._choose_mismatched_source_dates(
+                mismatched_source_dates
+            )
+            if treat_mismatched_source_dates_as_target is None:
+                self.window.append_log(
+                    "Procesarea a fost oprită deoarece există date din altă lună în fișierul sursă."
+                )
+                return
+            if treat_mismatched_source_dates_as_target:
+                formatted_mismatches = ", ".join(
+                    f"{source_day.strftime('%d.%m.%Y')} → {target_day.strftime('%d.%m.%Y')}"
+                    for source_day, target_day in mismatched_source_dates
+                )
+                self.window.append_log(
+                    f"Date tratate ca luna aleasă numai în raport: {formatted_mismatches}."
+                )
+
+        include_missing_source_days = True
+        missing_source_days = self._find_missing_source_days(
+            parsed_source_days,
+            source_target_year,
+            values["target_month_name"],
+            exclude_day_numbers={target_day.day for _source_day, target_day in mismatched_source_dates}
+            if treat_mismatched_source_dates_as_target
+            else set(),
+        )
+        if missing_source_days:
+            include_missing_source_days = self._choose_missing_source_days(missing_source_days)
+            if include_missing_source_days is None:
+                self.window.append_log(
+                    "Procesarea a fost oprită deoarece lipsesc zile din fișierul sursă."
+                )
+                return
+            formatted_days = ", ".join(day.strftime("%d.%m.%Y") for day in missing_source_days)
+            if include_missing_source_days:
+                self.window.append_log(
+                    f"Zile adăugate cu 0 în raport: {formatted_days}."
+                )
+            else:
+                self.window.append_log(
+                    f"Zile neincluse în raport: {formatted_days}."
+                )
 
         if template_mode == TEMPLATE_MODE_PREVIOUS_SHEET and not values["template_sheet_name"]:
             self._show_warning("Alege un sheet template pentru modul de copiere din sheet anterior.")
@@ -274,6 +341,8 @@ class AppController(QObject):
             template_sheet_name=values["template_sheet_name"] or None,
             attendance_path=attendance_path,
             allow_attendance_month_mismatch=allow_attendance_month_mismatch,
+            include_missing_source_days=include_missing_source_days,
+            treat_mismatched_source_dates_as_target=treat_mismatched_source_dates_as_target,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -328,6 +397,7 @@ class AppController(QObject):
                 f"{attendance_summary.approximate_matches} potriviri aproximative, "
                 f"{attendance_summary.co_days_applied} zile CO aplicate, "
                 f"{attendance_summary.n_days_applied} zile N aplicate, "
+                f"{attendance_summary.cm_days_applied} zile CM aplicate, "
                 f"{attendance_summary.mentiuni_days_colored} zile din mențiuni colorate, "
                 f"{attendance_summary.mentiuni_copied} mențiuni copiate, "
                 f"{len(attendance_summary.unmatched_names)} nepotriviți, "
@@ -337,6 +407,8 @@ class AppController(QObject):
                 self.window.append_log(f"Transatori+Detinuți fără potrivire: {name}")
             for name in attendance_summary.ambiguous_names:
                 self.window.append_log(f"Transatori+Detinuți ambiguu: {name}")
+            for name in attendance_summary.added_employees:
+                self.window.append_log(f"Angajat nou adăugat automat: {name}")
         for warning in result.warnings:
             self.window.append_log(f"Avertisment: {warning}")
         if result.differences:
@@ -392,6 +464,100 @@ class AppController(QObject):
             f"Fișier Transatori+Detinuți: {attendance_month}\n"
             f"Luna țintă selectată: {target_month_name}\n\n"
             "Vrei să continui oricum?",
+            APP_TITLE,
+        )
+
+    def _load_source_days_for_target_month(
+        self,
+        source_path: str,
+        target_month_name: str,
+    ) -> tuple[dict, int | None]:
+        path = Path(source_path)
+        if not path.exists():
+            return {}, None
+        try:
+            parsed_days = parse_source_days(path)
+        except ProcessorError:
+            return {}, None
+
+        month_name = normalize_label(target_month_name)
+        month_number = MONTH_NAMES.index(month_name) + 1 if month_name in MONTH_NAMES else None
+        if month_number is None:
+            return parsed_days, None
+        dates_in_target_month = [day for day in parsed_days if day.month == month_number]
+        target_year = dates_in_target_month[0].year if dates_in_target_month else None
+        return parsed_days, target_year
+
+    def _find_source_date_month_mismatches(
+        self,
+        parsed_days: dict,
+        target_year: int | None,
+        target_month_name: str,
+    ) -> list[tuple[date, date]]:
+        month_name = normalize_label(target_month_name)
+        if not parsed_days or target_year is None or month_name not in MONTH_NAMES:
+            return []
+        month_number = MONTH_NAMES.index(month_name) + 1
+        return [
+            (mismatch.source_date, mismatch.target_date)
+            for mismatch in find_source_date_month_mismatches(
+                parsed_days,
+                target_year,
+                month_number,
+            )
+        ]
+
+    def _find_missing_source_days(
+        self,
+        parsed_days: dict,
+        target_year: int | None,
+        target_month_name: str,
+        *,
+        exclude_day_numbers: set[int],
+    ) -> list[date]:
+        """Return target-month working days that do not occur in the source file.
+
+        This is a non-blocking preflight check. The worker remains responsible for
+        reporting malformed or unreadable source files with the standard error.
+        """
+        if not parsed_days or target_year is None:
+            return []
+
+        month_name = normalize_label(target_month_name)
+        month_number = MONTH_NAMES.index(month_name) + 1 if month_name in MONTH_NAMES else None
+        if month_number is None:
+            return []
+
+        target_days = build_target_day_columns(target_year, month_number)
+        _included_days, missing_days = filter_target_days_to_source(target_days, parsed_days)
+        return [day for day in missing_days if day.day not in exclude_day_numbers]
+
+    def _choose_mismatched_source_dates(
+        self,
+        mismatched_dates: list[tuple[date, date]],
+    ) -> bool | None:
+        formatted_mismatches = ", ".join(
+            f"{source_day.strftime('%d.%m.%Y')} → {target_day.strftime('%d.%m.%Y')}"
+            for source_day, target_day in mismatched_dates
+        )
+        return choose_mismatched_source_dates_dialog(
+            self.window,
+            "Fișierul Situație are date într-o lună diferită, iar zilele respective "
+            "lipsesc din luna aleasă:\n"
+            f"{formatted_mismatches}\n\n"
+            "Vrei să le tratezi ca zile din luna aleasă? Corecția se aplică numai "
+            "în raportul generat și nu modifică fișierul sursă.",
+            APP_TITLE,
+        )
+
+    def _choose_missing_source_days(self, missing_days: list[date]) -> bool | None:
+        formatted_days = ", ".join(day.strftime("%d.%m.%Y") for day in missing_days)
+        return choose_missing_source_days_dialog(
+            self.window,
+            "Fișierul Situație nu conține date pentru:\n"
+            f"{formatted_days}\n\n"
+            "Vrei să le adaugi în raportul final cu valoarea 0 și culoarea galbenă?\n\n"
+            "Poți și să continui fără aceste zile în raport sau să oprești procesarea.",
             APP_TITLE,
         )
 

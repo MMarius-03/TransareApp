@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 import app_controller
 import processor
 from app_window import TEMPLATE_MODE_PREDEFINED_LABEL, TEMPLATE_MODE_PREVIOUS_SHEET_LABEL
-from tests.conftest import build_attendance_workbook, build_source_workbook, build_target_workbook
+from tests.conftest import (
+    build_attendance_workbook,
+    build_source_workbook,
+    build_source_workbook_for_dates,
+    build_target_workbook,
+)
 
 
 class DummySignal:
@@ -231,6 +238,8 @@ def test_start_run_creates_worker_with_new_contract(controller: app_controller.A
         "template_sheet_name": "martie",
         "attendance_path": None,
         "allow_attendance_month_mismatch": False,
+        "include_missing_source_days": True,
+        "treat_mismatched_source_dates_as_target": False,
     }
 
 
@@ -240,7 +249,11 @@ def test_start_run_can_continue_after_attendance_month_mismatch(
     monkeypatch,
 ) -> None:
     attendance = tmp_path / "attendance.xlsx"
-    build_attendance_workbook(attendance, title="TRANŞARE - MARTIE 2026")
+    build_attendance_workbook(
+        attendance,
+        title="TRANŞARE - MARTIE 2026",
+        period_label="01-31.03.2026",
+    )
     monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
     monkeypatch.setattr(app_controller, "QThread", FakeThread)
     controller._confirm_attendance_month_mismatch = lambda *_args: True
@@ -260,6 +273,178 @@ def test_start_run_can_continue_after_attendance_month_mismatch(
     assert FakeWorker.last_kwargs["allow_attendance_month_mismatch"] is True
 
 
+def test_start_run_warns_and_can_continue_when_source_days_are_missing(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    build_source_workbook(source)
+    monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
+    monkeypatch.setattr(app_controller, "QThread", FakeThread)
+    confirmations: list[list[date]] = []
+    controller._choose_missing_source_days = lambda missing_days: confirmations.append(missing_days) or True
+    controller.window.values = {
+        "source_path": str(source),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+
+    controller.start_run()
+
+    assert confirmations == [[date(2026, 4, 7), date(2026, 4, 8), date(2026, 4, 9), date(2026, 4, 10), date(2026, 4, 11), date(2026, 4, 13), date(2026, 4, 14), date(2026, 4, 15), date(2026, 4, 16), date(2026, 4, 17), date(2026, 4, 18), date(2026, 4, 20), date(2026, 4, 21), date(2026, 4, 22), date(2026, 4, 23), date(2026, 4, 24), date(2026, 4, 25), date(2026, 4, 27), date(2026, 4, 28), date(2026, 4, 29), date(2026, 4, 30)]]
+    assert isinstance(controller._thread, FakeThread)
+    assert FakeWorker.last_kwargs is not None
+    assert FakeWorker.last_kwargs["include_missing_source_days"] is True
+    assert any("Zile adăugate cu 0" in message for message in controller.window.log_messages)
+
+
+def test_start_run_stops_when_user_declines_missing_source_days(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    build_source_workbook(source)
+    controller._choose_missing_source_days = lambda _missing_days: None
+    controller.window.values = {
+        "source_path": str(source),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+
+    controller.start_run()
+
+    assert controller._thread is None
+    assert controller._worker is None
+    assert controller.window.log_messages[-1] == "Procesarea a fost oprită deoarece lipsesc zile din fișierul sursă."
+
+
+def test_start_run_can_exclude_missing_source_days_from_report(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    build_source_workbook(source)
+    monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
+    monkeypatch.setattr(app_controller, "QThread", FakeThread)
+    controller._choose_missing_source_days = lambda _missing_days: False
+    controller.window.values = {
+        "source_path": str(source),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+
+    controller.start_run()
+
+    assert FakeWorker.last_kwargs is not None
+    assert FakeWorker.last_kwargs["include_missing_source_days"] is False
+    assert any("Zile neincluse în raport" in message for message in controller.window.log_messages)
+
+
+def test_start_run_can_treat_wrong_month_source_dates_as_selected_month(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    source_dates = processor.build_target_day_columns(2026, 4)
+    build_source_workbook_for_dates(source, source_dates)
+    workbook = load_workbook(source)
+    workbook.active["A8"] = "07.03.2026"
+    workbook.save(source)
+    workbook.close()
+    monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
+    monkeypatch.setattr(app_controller, "QThread", FakeThread)
+    confirmations: list[list[tuple[date, date]]] = []
+    controller._choose_mismatched_source_dates = lambda mismatches: confirmations.append(mismatches) or True
+    controller.window.values = {
+        "source_path": str(source),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+
+    controller.start_run()
+
+    assert confirmations == [[(date(2026, 3, 7), date(2026, 4, 7))]]
+    assert FakeWorker.last_kwargs is not None
+    assert FakeWorker.last_kwargs["treat_mismatched_source_dates_as_target"] is True
+    assert any("07.03.2026 → 07.04.2026" in message for message in controller.window.log_messages)
+
+
+def test_start_run_stops_when_user_declines_wrong_month_source_dates(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    source_dates = processor.build_target_day_columns(2026, 4)
+    build_source_workbook_for_dates(source, source_dates)
+    workbook = load_workbook(source)
+    workbook.active["A8"] = "07.03.2026"
+    workbook.save(source)
+    workbook.close()
+    controller._choose_mismatched_source_dates = lambda _mismatches: None
+    controller.window.values = {
+        "source_path": str(source),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+
+    controller.start_run()
+
+    assert controller._thread is None
+    assert controller.window.log_messages[-1] == (
+        "Procesarea a fost oprită deoarece există date din altă lună în fișierul sursă."
+    )
+
+
+def test_start_run_can_keep_wrong_month_source_dates_unchanged(
+    controller: app_controller.AppController,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    source_dates = processor.build_target_day_columns(2026, 4)
+    build_source_workbook_for_dates(source, source_dates)
+    workbook = load_workbook(source)
+    workbook.active["A8"] = "07.03.2026"
+    workbook.save(source)
+    workbook.close()
+    monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
+    monkeypatch.setattr(app_controller, "QThread", FakeThread)
+    controller._choose_mismatched_source_dates = lambda _mismatches: False
+    controller._choose_missing_source_days = lambda _missing_days: False
+    controller.window.values = {
+        "source_path": str(source),
+        "target_path": str(tmp_path / "target.xlsx"),
+        "attendance_path": "",
+        "target_month_name": "aprilie",
+        "template_mode_label": TEMPLATE_MODE_PREDEFINED_LABEL,
+        "template_sheet_name": "martie",
+    }
+
+    controller.start_run()
+
+    assert FakeWorker.last_kwargs is not None
+    assert FakeWorker.last_kwargs["treat_mismatched_source_dates_as_target"] is False
+    assert FakeWorker.last_kwargs["include_missing_source_days"] is False
+
+
 def test_start_run_prompts_on_attendance_year_mismatch_with_same_month(
     controller: app_controller.AppController,
     tmp_path: Path,
@@ -267,7 +452,11 @@ def test_start_run_prompts_on_attendance_year_mismatch_with_same_month(
 ) -> None:
     attendance = tmp_path / "attendance.xlsx"
     # Same month as target (aprilie) but a different year than the detected source.
-    build_attendance_workbook(attendance, title="TRANŞARE - APRILIE 2025")
+    build_attendance_workbook(
+        attendance,
+        title="TRANŞARE - APRILIE 2025",
+        period_label="01-30.04.2025",
+    )
     monkeypatch.setattr(app_controller, "RunWorker", FakeWorker)
     monkeypatch.setattr(app_controller, "QThread", FakeThread)
     controller.detected_source_year = 2026

@@ -72,7 +72,7 @@ def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path:
     assert result.template_source_name == "martie"
     assert result.mapped_days == 5
     assert len(result.warnings) == 1
-    assert "Zile eliminate din tabel" in result.warnings[0]
+    assert "Zile colorate galben pentru că lipsesc din sursă" in result.warnings[0]
     assert "13.04.2026" in result.warnings[0]
 
     wb = load_workbook(result.output_file, data_only=False)
@@ -81,11 +81,13 @@ def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path:
     ws = wb["aprilie"]
     layout = processor.get_sheet_layout(ws)
 
-    assert layout.day_end_col - layout.day_start_col + 1 == 5
+    # All 26 April workdays remain in the table; missing ones are highlighted yellow.
+    assert layout.day_end_col - layout.day_start_col + 1 == 26
     assert ws.sheet_view.zoomScale == 55
     assert ws["C5"].fill.fgColor.rgb == "00F2E2D1"
     assert ws["G5"].value == 6.04
-    assert ws["H5"].value == "VACI TRAN "
+    summary_letter = get_column_letter(layout.summary_start_col)
+    assert ws.cell(5, layout.summary_start_col).value == "VACI TRAN "
     target_rate_cell = _target_rate_cell(ws, layout)
     assert target_rate_cell.value == 166
     assert target_rate_cell.fill.fgColor.rgb == "00DDEBFF"
@@ -95,10 +97,14 @@ def test_run_fill_predefined_mode_creates_new_aprilie_sheet_from_asset(tmp_path:
     assert ws["D6"].value == "=100+12/6"
     assert ws["D7"].value == 14.67
     assert ws["C13"].value == 120
-    assert ws["I6"].value == '=COUNTIF(C7:G7,">0")'
-    assert ws["J6"].value == "=I6*$J$4"
+    zile_col_letter = get_column_letter(layout.summary_start_col + 1)
+    last_day_letter = get_column_letter(layout.day_end_col)
+    assert ws.cell(6, layout.summary_start_col + 1).value == f'=COUNTIF(C7:{last_day_letter}7,">0")'
+    target_col_letter = get_column_letter(layout.summary_start_col + 2)
+    target_rate_ref_letter = get_column_letter(target_rate_cell.column)
+    assert ws.cell(6, layout.summary_start_col + 2).value == f"={zile_col_letter}6*${target_rate_ref_letter}${target_rate_cell.row}"
     workday_count_cell = _workday_count_cell(ws, layout)
-    assert ws["L6"].value == f"=${get_column_letter(workday_count_cell.column)}${workday_count_cell.row}"
+    assert ws.cell(6, layout.summary_start_col + 4).value == f"=${get_column_letter(workday_count_cell.column)}${workday_count_cell.row}"
     assert workday_count_cell.value == 5
     assert workday_count_cell.fill.fgColor.rgb == "00C6EFCE"
     assert workday_count_cell.font.bold is True
@@ -175,7 +181,7 @@ def test_run_fill_reports_friendly_error_when_target_is_locked(tmp_path: Path, m
     assert "salarii.xlsx" in message
 
 
-def test_run_fill_excludes_non_sunday_days_missing_from_source(tmp_path: Path) -> None:
+def test_run_fill_keeps_missing_days_as_yellow_columns(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     all_april_days = processor.build_target_day_columns(2026, 4)
@@ -203,35 +209,121 @@ def test_run_fill_excludes_non_sunday_days_missing_from_source(tmp_path: Path) -
         for col in range(layout.day_start_col, layout.day_end_col + 1)
     ]
 
-    assert len(header_values) == 24
-    assert 11.04 not in header_values
-    assert 13.04 not in header_values
+    # All 26 April workdays remain (11.04 and 13.04 stay but are highlighted yellow)
+    assert len(header_values) == 26
+    assert 11.04 in header_values
+    assert 13.04 in header_values
+    # Missing day columns are painted pure yellow on every row of every block
+    missing_11_col = layout.day_start_col + header_values.index(11.04)
+    for row in range(6, 11):
+        assert worksheet.cell(row, missing_11_col).fill.fgColor.rgb == "00FFFF00"
     assert worksheet.cell(5, layout.summary_start_col).value == "VACI TRAN "
     workday_count_cell = _workday_count_cell(worksheet, layout)
     assert worksheet.cell(6, layout.summary_start_col + 4).value == f"=${get_column_letter(workday_count_cell.column)}${workday_count_cell.row}"
+    # workday_count counts only days that actually had transatori in the source (24)
     assert workday_count_cell.value == 24
     assert worksheet.cell(6, layout.summary_start_col + 8).value == 9500
     target_rate_cell = _target_rate_cell(worksheet, layout)
     target_rate_ref = f"${get_column_letter(target_rate_cell.column)}${target_rate_cell.row}"
+    zile_col_letter = get_column_letter(layout.summary_start_col + 1)
     zile_lucratoare_ref = f"{get_column_letter(layout.summary_start_col + 4)}6"
     bani_in_plus_ref = f"{get_column_letter(layout.summary_start_col + 7)}6"
     salar_baza_ref = f"{get_column_letter(layout.summary_start_col + 8)}6"
+    sum_col_letter = get_column_letter(layout.summary_start_col)
+    workday_count_letter = get_column_letter(layout.summary_start_col + 4)
+    de_platit_letter = get_column_letter(layout.summary_start_col + 3)
+    target_col_letter = get_column_letter(layout.summary_start_col + 2)
+    last_day_letter = get_column_letter(layout.day_end_col)
     assert target_rate_cell.value == 166
     assert target_rate_cell.fill.fgColor.rgb == "00DDEBFF"
-    assert worksheet.cell(6, layout.summary_start_col + 2).value == f"=AB6*{target_rate_ref}"
+    assert worksheet.cell(6, layout.summary_start_col + 2).value == f"={zile_col_letter}6*{target_rate_ref}"
     assert worksheet.cell(6, layout.summary_start_col + 6).value == f"={salar_baza_ref}/{zile_lucratoare_ref}"
     assert worksheet.cell(6, layout.summary_start_col + 9).value == f"={salar_baza_ref}+{bani_in_plus_ref}"
-    assert worksheet.cell(8, layout.summary_start_col).value == "=SUM(C8:Z8)"
-    assert worksheet.cell(9, layout.summary_start_col).value == "=SUM(C9:Z9)"
-    assert worksheet.cell(10, layout.summary_start_col).value == "=SUM(C10:Z10)"
+    assert worksheet.cell(8, layout.summary_start_col).value == f"=SUM(C8:{last_day_letter}8)"
+    assert worksheet.cell(9, layout.summary_start_col).value == f"=SUM(C9:{last_day_letter}9)"
+    assert worksheet.cell(10, layout.summary_start_col).value == f"=SUM(C10:{last_day_letter}10)"
     assert worksheet.cell(8, layout.summary_start_col + 2).value == "cost /vaca"
     assert worksheet.cell(9, layout.summary_start_col + 2).value == "bani  in plus"
-    assert worksheet.cell(8, layout.summary_start_col + 4).value == "=AG6/11.5"
-    assert worksheet.cell(9, layout.summary_start_col + 4).value == "=AA10*AE8"
-    assert worksheet.cell(10, layout.summary_start_col + 5).value == "=AD10/175"
+    salar_pe_zi_letter = get_column_letter(layout.summary_start_col + 6)
+    assert worksheet.cell(8, layout.summary_start_col + 4).value == f"={salar_pe_zi_letter}6/11.5"
+    assert worksheet.cell(9, layout.summary_start_col + 4).value == f"={sum_col_letter}10*{workday_count_letter}8"
+    assert worksheet.cell(10, layout.summary_start_col + 5).value == f"={de_platit_letter}10/175"
     assert result.warnings == [
-        "Zile eliminate din tabel pentru că lipsesc din sursă: 11.04.2026, 13.04.2026"
+        "Zile colorate galben pentru că lipsesc din sursă: 11.04.2026, 13.04.2026"
     ]
+
+    workbook.close()
+
+
+def test_run_fill_can_exclude_missing_days_from_the_generated_report(tmp_path: Path) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    all_april_days = processor.build_target_day_columns(2026, 4)
+    source_days = [
+        current_day
+        for current_day in all_april_days
+        if current_day not in {date(2026, 4, 11), date(2026, 4, 13)}
+    ]
+    build_source_workbook_for_dates(source_path, source_days)
+    build_target_workbook(target_path)
+
+    result = processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="aprilie",
+        template_sheet_name="martie",
+        include_missing_source_days=False,
+    )
+
+    workbook = load_workbook(result.output_file, data_only=False)
+    worksheet = workbook["aprilie"]
+    layout = processor.get_sheet_layout(worksheet)
+    header_values = [
+        worksheet.cell(5, col).value
+        for col in range(layout.day_start_col, layout.day_end_col + 1)
+    ]
+
+    assert len(header_values) == 24
+    assert 11.04 not in header_values
+    assert 13.04 not in header_values
+    assert _workday_count_cell(worksheet, layout).value == 24
+    assert result.warnings == [
+        "Zile neincluse în tabel pentru că lipsesc din sursă: 11.04.2026, 13.04.2026"
+    ]
+
+    workbook.close()
+
+
+def test_run_fill_can_treat_wrong_month_source_date_as_target_month(tmp_path: Path) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    source_days = processor.build_target_day_columns(2026, 4)
+    build_source_workbook_for_dates(source_path, source_days)
+    workbook = load_workbook(source_path)
+    worksheet = workbook.active
+    worksheet["A8"] = "07.03.2026"
+    workbook.save(source_path)
+    workbook.close()
+    build_target_workbook(target_path)
+
+    result = processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="aprilie",
+        template_sheet_name="martie",
+        treat_mismatched_source_dates_as_target=True,
+    )
+
+    workbook = load_workbook(result.output_file, data_only=False)
+    worksheet = workbook["aprilie"]
+    layout = processor.get_sheet_layout(worksheet)
+    day_seven_col = _day_column(worksheet, layout, 7)
+
+    assert worksheet.cell(6, day_seven_col).value == 106
+    assert worksheet.cell(7, day_seven_col).value == 15
+    assert any("07.03.2026 → 07.04.2026" in warning for warning in result.warnings)
 
     workbook.close()
 
@@ -267,7 +359,8 @@ def test_run_fill_previous_sheet_mode_overwrites_stale_global_target_rate(tmp_pa
 
     assert target_rate_cell.value == 166
     assert target_rate_cell.fill.fgColor.rgb == "00DDEBFF"
-    assert target_formula == f"=I6*${get_column_letter(target_rate_cell.column)}${target_rate_cell.row}"
+    zile_col_letter = get_column_letter(layout.summary_start_col + 1)
+    assert target_formula == f"={zile_col_letter}6*${get_column_letter(target_rate_cell.column)}${target_rate_cell.row}"
     assert "*166" not in target_formula
 
     workbook.close()
@@ -317,7 +410,7 @@ def test_run_fill_does_not_generate_formula_ranges_that_include_their_own_cell(t
     workbook.close()
 
 
-def test_run_fill_ignores_attendance_co_days_removed_from_generated_table(tmp_path: Path) -> None:
+def test_run_fill_ignores_attendance_co_days_for_days_missing_from_source(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
@@ -351,8 +444,10 @@ def test_run_fill_ignores_attendance_co_days_removed_from_generated_table(tmp_pa
         for col in range(layout.day_start_col, layout.day_end_col + 1)
     ]
 
-    assert 11.04 not in header_values
-    assert 13.04 not in header_values
+    # Missing-from-source days remain in the header (colored yellow), but the CO from
+    # attendance is skipped for them because the cell is already the zero/zero pair.
+    assert 11.04 in header_values
+    assert 13.04 in header_values
     assert result.attendance_summary is not None
     assert result.attendance_summary.co_days_applied == 0
     assert result.attendance_summary.mentiuni_days_colored == 0
@@ -414,8 +509,12 @@ def test_run_fill_previous_sheet_mode_numbers_existing_target_and_inserts_before
     ws = wb["aprilie (2)"]
     assert ws["A1"].value is None
     assert ws["G12"].value == 6.04
-    assert ws["H5"].value == "VACI TRAN "
-    assert ws["Q6"].value == "=P6+O6"
+    layout_ws = processor.get_sheet_layout(ws)
+    assert ws.cell(5, layout_ws.summary_start_col).value == "VACI TRAN "
+    salar_baza_letter = get_column_letter(layout_ws.summary_start_col + 8)
+    bani_in_plus_letter = get_column_letter(layout_ws.summary_start_col + 7)
+    total_col = layout_ws.summary_start_col + 9
+    assert ws.cell(6, total_col).value == f"={salar_baza_letter}6+{bani_in_plus_letter}6"
     assert _formula_cells(wb["aprilie pentru teste (2)"]) == []
     wb.close()
 
@@ -521,6 +620,8 @@ def test_run_fill_with_attendance_applies_co_days_and_mentiuni(tmp_path: Path) -
 
     workbook = load_workbook(result.output_file, data_only=False)
     worksheet = workbook["aprilie"]
+    layout_apr = processor.get_sheet_layout(worksheet)
+    mentiuni_col_letter = get_column_letter(layout_apr.summary_start_col + 12)
 
     assert worksheet["D6"].value == 0
     assert worksheet["D7"].value == 0
@@ -529,22 +630,26 @@ def test_run_fill_with_attendance_applies_co_days_and_mentiuni(tmp_path: Path) -
     assert worksheet["D8"].value == "=IF(D7>0,D6/D7,0)"
     assert worksheet["D9"].value == "=IF(D7>0,11.5,0)"
     assert worksheet["D10"].value == "=IF(D7>0,D8-D9,0)"
-    assert worksheet["D6"].fill.fgColor.rgb == "00FFF2CC"
-    assert worksheet["T5"].value == "Mentiuni"
-    assert worksheet["T6"].value == "07.04 - a plecat la 15:00"
-    assert worksheet["T6"].fill.fgColor.rgb == "00FFF2CC"
-    assert worksheet["T13"].value is None
+    assert worksheet["D6"].fill.fgColor.rgb == "00FFFF00"
+    assert worksheet[f"{mentiuni_col_letter}5"].value == "Mentiuni"
+    assert worksheet[f"{mentiuni_col_letter}6"].value == "07.04 - a plecat la 15:00"
+    # Mentiuni note cell inherits the "off" fill of the row, which is now pure yellow
+    # (since missing-source days paint the block yellow).
+    assert worksheet[f"{mentiuni_col_letter}6"].fill.fgColor.rgb == "00FFFF00"
+    assert worksheet[f"{mentiuni_col_letter}13"].value is None
     assert worksheet.row_dimensions[6].height >= 18
     assert result.attendance_summary is not None
     assert result.attendance_summary.matched_employees == 1
     assert result.attendance_summary.co_days_applied == 2
-    assert result.attendance_summary.mentiuni_days_colored == 0
+    # Day 7 now stays in the table (yellow, missing from source) so the mentiuni
+    # day-fill is applied instead of skipped.
+    assert result.attendance_summary.mentiuni_days_colored == 1
     assert result.attendance_summary.mentiuni_copied == 1
 
     workbook.close()
 
 
-def test_run_fill_with_attendance_applies_n_days_like_co(tmp_path: Path) -> None:
+def test_run_fill_with_attendance_applies_n_days_as_yellow_zero_absences(tmp_path: Path) -> None:
     source_path = tmp_path / "situatie.xlsx"
     target_path = tmp_path / "salarii.xlsx"
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
@@ -583,12 +688,55 @@ def test_run_fill_with_attendance_applies_n_days_like_co(tmp_path: Path) -> None
     assert worksheet.cell(6, n_col).value == 0
     assert worksheet.cell(7, n_col).value == 0
     for row in (5, 6, 7, 8, 9, 10):
-        assert worksheet.cell(row, n_col).fill.fgColor.rgb == "00FFF2CC"
+        assert worksheet.cell(row, n_col).fill.fgColor.rgb == "00FFFF00"
+    for row in (5, 6, 7, 8, 9, 10):
         assert worksheet.cell(row, mentiuni_col).fill.fgColor.rgb == "00FFF8D6"
     assert result.attendance_summary is not None
     assert result.attendance_summary.co_days_applied == 1
     assert result.attendance_summary.n_days_applied == 1
     assert result.attendance_summary.mentiuni_days_colored == 1
+
+    workbook.close()
+
+
+def test_run_fill_with_attendance_applies_cm_days_as_yellow_zero_absences(tmp_path: Path) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    attendance_path = tmp_path / "transatori_detinuti.xlsx"
+    source_days = [
+        date(2026, 4, 1),
+        date(2026, 4, 2),
+        date(2026, 4, 3),
+        date(2026, 4, 4),
+        date(2026, 4, 6),
+    ]
+    build_source_workbook_for_dates(source_path, source_days)
+    build_target_workbook(target_path)
+    build_attendance_workbook(
+        attendance_path,
+        rows=[("CIOCLEA IOAN", None, None, "04", None)],
+    )
+
+    result = processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="aprilie",
+        template_sheet_name="martie",
+        attendance_path=attendance_path,
+    )
+
+    workbook = load_workbook(result.output_file, data_only=False)
+    worksheet = workbook["aprilie"]
+    layout = processor.get_sheet_layout(worksheet)
+    cm_col = _day_column(worksheet, layout, 4)
+
+    assert worksheet.cell(6, cm_col).value == 0
+    assert worksheet.cell(7, cm_col).value == 0
+    for row in (5, 6, 7, 8, 9, 10):
+        assert worksheet.cell(row, cm_col).fill.fgColor.rgb == "00FFFF00"
+    assert result.attendance_summary is not None
+    assert result.attendance_summary.cm_days_applied == 1
 
     workbook.close()
 
@@ -715,7 +863,7 @@ def test_run_fill_with_attendance_keeps_co_fill_when_co_and_mentiuni_overlap(tmp
     assert worksheet.cell(6, day_col).value == 0
     assert worksheet.cell(7, day_col).value == 0
     for row in (5, 6, 7, 8, 9, 10):
-        assert worksheet.cell(row, day_col).fill.fgColor.rgb == "00FFF2CC"
+        assert worksheet.cell(row, day_col).fill.fgColor.rgb == "00FFFF00"
     assert result.attendance_summary is not None
     assert result.attendance_summary.co_days_applied == 1
     assert result.attendance_summary.mentiuni_days_colored == 0
@@ -750,9 +898,12 @@ def test_run_fill_with_attendance_inserts_mentiuni_when_neighbor_column_is_not_b
 
     workbook = load_workbook(result.output_file, data_only=False)
     worksheet = workbook["aprilie"]
+    layout_apr = processor.get_sheet_layout(worksheet)
+    mentiuni_col_letter = get_column_letter(layout_apr.summary_start_col + 12)
+    reserved_col_letter = get_column_letter(layout_apr.summary_start_col + 13)
 
-    assert worksheet["T5"].value == "Mentiuni"
-    assert worksheet["U5"].value == "RESERVED"
+    assert worksheet[f"{mentiuni_col_letter}5"].value == "Mentiuni"
+    assert worksheet[f"{reserved_col_letter}5"].value == "RESERVED"
 
     workbook.close()
 
@@ -789,12 +940,27 @@ def test_run_fill_with_attendance_uses_approximate_matching_and_logs_unmatched(t
 
     workbook = load_workbook(result.output_file, data_only=False)
     worksheet = workbook["aprilie"]
-
-    assert worksheet["D13"].value == 0
-    assert worksheet["T13"].value == "notă aproximativă"
+    layout_apr = processor.get_sheet_layout(worksheet)
+    blocks_apr = processor.detect_sheet_blocks(worksheet, layout_apr)
+    mentiuni_col_letter = get_column_letter(layout_apr.summary_start_col + 12)
+    # Find the NECHIFOR block (approximate match target) by name
+    nechifor_block = next(
+        b for b in blocks_apr
+        if processor.normalize_person_name(worksheet.cell(b.value_row, 2).value or "")
+        == processor.normalize_person_name("NECHIFOR NELU FLORIN")
+    )
+    assert worksheet.cell(nechifor_block.value_row, 4).value == 0  # day 2.04 -> CO
+    assert worksheet.cell(nechifor_block.value_row, layout_apr.summary_start_col + 12).value == "notă aproximativă"
     assert result.attendance_summary is not None
     assert result.attendance_summary.approximate_matches == 1
-    assert result.attendance_summary.unmatched_names == ["PERSOANA LIPSA"]
+    # PERSOANA LIPSA is now automatically added as a new employee row instead of being
+    # left in unmatched_names, so unmatched is empty and added_employees contains it.
+    assert result.attendance_summary.unmatched_names == []
+    assert result.attendance_summary.added_employees == ["PERSOANA LIPSA"]
+    named_blocks = [block for block in blocks_apr if worksheet.cell(block.value_row, 2).value]
+    assert [worksheet.cell(block.value_row, 1).value for block in named_blocks] == list(
+        range(1, len(named_blocks) + 1)
+    )
 
     workbook.close()
 
@@ -839,7 +1005,11 @@ def test_run_fill_with_attendance_month_mismatch_blocks_by_default_and_can_conti
     attendance_path = tmp_path / "transatori_detinuti.xlsx"
     build_source_workbook(source_path)
     build_target_workbook(target_path)
-    build_attendance_workbook(attendance_path, title="TRANŞARE - MARTIE 2026")
+    build_attendance_workbook(
+        attendance_path,
+        title="TRANŞARE - MARTIE 2026",
+        period_label="01-31.03.2026",
+    )
 
     try:
         processor.run_fill(
@@ -866,6 +1036,36 @@ def test_run_fill_with_attendance_month_mismatch_blocks_by_default_and_can_conti
     )
 
     assert result.output_file.exists()
+
+
+def test_run_fill_sorts_employee_blocks_alphabetically(tmp_path: Path) -> None:
+    source_path = tmp_path / "situatie.xlsx"
+    target_path = tmp_path / "salarii.xlsx"
+    build_source_workbook(source_path)
+    build_target_workbook(target_path)
+
+    workbook = load_workbook(target_path)
+    worksheet = workbook["martie"]
+    worksheet["B6"] = "ZETU ION"
+    worksheet["B13"] = "ALBU ION"
+    workbook.save(target_path)
+    workbook.close()
+
+    processor.run_fill(
+        source_path=source_path,
+        target_path=target_path,
+        template_mode=processor.TEMPLATE_MODE_PREVIOUS_SHEET,
+        target_month_name="aprilie",
+        template_sheet_name="martie",
+    )
+
+    workbook = load_workbook(target_path, data_only=False)
+    worksheet = workbook["aprilie"]
+    blocks = processor.detect_sheet_blocks(worksheet, None)
+    names = [worksheet.cell(block.value_row, 2).value for block in blocks]
+    workbook.close()
+
+    assert names[:2] == ["ALBU ION", "ZETU ION"]
 
 
 def test_run_fill_validates_source_month_mismatch(tmp_path: Path) -> None:

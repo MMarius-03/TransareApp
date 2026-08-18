@@ -125,30 +125,34 @@ def build_source_pdf(path: Path) -> None:
 def _unpack_attendance_row(row):
     if len(row) == 3:
         name, co_days, mentiuni = row
-        return name, co_days, None, mentiuni
-    name, co_days, n_days, mentiuni = row
-    return name, co_days, n_days, mentiuni
+        return name, co_days, None, None, mentiuni
+    if len(row) == 4:
+        name, co_days, n_days, mentiuni = row
+        return name, co_days, n_days, None, mentiuni
+    name, co_days, n_days, cm_days, mentiuni = row
+    return name, co_days, n_days, cm_days, mentiuni
 
 
 def build_attendance_workbook(
     path: Path,
     rows: list[tuple] | None = None,
     title: str = "TRANŞARE - APRILIE 2026",
+    period_label: str = "01-30.04.2026",
 ) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "aprilie"
     ws["A1"] = title
     ws.append([])
-    ws.append(["Nr. crt.", "Nume și prenume", "CO", "N", "CM", "01-30.04.2026", "Mentiuni"])
+    ws.append(["Nr. crt.", "Nume și prenume", "CO", "N", "CM", period_label, "Mentiuni"])
 
     rows = rows or [
         ("CIOCLEA IOAN", "02,06", "07.04 - a plecat la 15:00"),
         ("COJOCARIU SERGIU", None, None),
     ]
     for index, row in enumerate(rows, start=1):
-        name, co_days, n_days, mentiuni = _unpack_attendance_row(row)
-        ws.append([index, name, co_days, n_days, None, "24//26", mentiuni])
+        name, co_days, n_days, cm_days, mentiuni = _unpack_attendance_row(row)
+        ws.append([index, name, co_days, n_days, cm_days, "24//26", mentiuni])
 
     wb.save(path)
     wb.close()
@@ -158,17 +162,18 @@ def build_attendance_pdf(
     path: Path,
     rows: list[tuple] | None = None,
     title: str = "TRANSARE - APRILIE 2026",
+    period_label: str = "01-30.04.2026",
 ) -> None:
     doc = SimpleDocTemplate(str(path), pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24)
     styles = getSampleStyleSheet()
-    table_data = [["Nr. crt.", "Nume si prenume", "CO", "N", "CM", "01-30.04.2026", "Mentiuni"]]
+    table_data = [["Nr. crt.", "Nume si prenume", "CO", "N", "CM", period_label, "Mentiuni"]]
     rows = rows or [
         ("CIOCLEA IOAN", "02,06", None, "07.04 - a plecat la 15:00"),
         ("COJOCARIU SERGIU", None, None, None),
     ]
     for index, row in enumerate(rows, start=1):
-        name, co_days, n_days, mentiuni = _unpack_attendance_row(row)
-        table_data.append([index, name, co_days or "", n_days or "", "", "24//26", mentiuni or ""])
+        name, co_days, n_days, cm_days, mentiuni = _unpack_attendance_row(row)
+        table_data.append([index, name, co_days or "", n_days or "", cm_days or "", "24//26", mentiuni or ""])
 
     table = Table(table_data, colWidths=[48, 210, 74, 74, 54, 110, 180])
     table.setStyle(

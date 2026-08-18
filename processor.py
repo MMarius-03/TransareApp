@@ -5,7 +5,7 @@ import math
 import os
 import re
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Iterable
@@ -73,6 +73,7 @@ PARENTHETICAL_RE = re.compile(r"\([^)]*\)")
 PERSON_NAME_STOP_WORDS = {"de", "din", "si", "a", "al", "ai", "ale", "lui"}
 MENTIUNI_HEADER = "Mentiuni"
 MENTIUNI_DAY_FILL = PatternFill(fill_type="solid", fgColor="FFF8D6")
+CO_DAY_FILL = PatternFill(fill_type="solid", fgColor="FFFF00")
 TARGET_RATE_VALUE = 166
 TARGET_RATE_FILL = PatternFill(fill_type="solid", fgColor="DDEBFF")
 WORKDAY_COUNT_FILL = PatternFill(fill_type="solid", fgColor="C6EFCE")
@@ -100,6 +101,12 @@ class ParsedDay:
     ovine_count: float
     value: float | str
     transatori_average: float
+
+
+@dataclass(frozen=True)
+class SourceDateMonthMismatch:
+    source_date: date
+    target_date: date
 
 
 @dataclass(frozen=True)
@@ -133,6 +140,25 @@ class BlockDayFillProfile:
 
 
 @dataclass(frozen=True)
+class BlockCellState:
+    value: object
+    style: object
+    number_format: str
+    font: object
+    fill: object
+    border: object
+    alignment: object
+    protection: object
+    comment: object | None
+
+
+@dataclass(frozen=True)
+class BlockSnapshot:
+    row_heights: tuple[float | None, ...]
+    rows: tuple[tuple[BlockCellState, ...], ...]
+
+
+@dataclass(frozen=True)
 class TemplateBuildResult:
     worksheet: Worksheet
     template_source_name: str | None
@@ -147,6 +173,7 @@ class AttendanceEntry:
     mentiuni_days: tuple[int, ...]
     mentiuni: str
     n_days: tuple[int, ...] = ()
+    cm_days: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,6 +182,7 @@ class AttendanceHeader:
     name_col: int
     co_col: int
     n_col: int | None
+    cm_col: int | None
     mentiuni_col: int
 
 
@@ -185,10 +213,12 @@ class AttendanceApplySummary:
     approximate_matches: int = 0
     co_days_applied: int = 0
     n_days_applied: int = 0
+    cm_days_applied: int = 0
     mentiuni_days_colored: int = 0
     mentiuni_copied: int = 0
     unmatched_names: list[str] = field(default_factory=list)
     ambiguous_names: list[str] = field(default_factory=list)
+    added_employees: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -356,11 +386,63 @@ def build_target_day_columns(year: int, month: int) -> list[date]:
 def filter_target_days_to_source(
     target_days: list[date],
     parsed_days: dict[date, ParsedDay],
+    *,
+    include_missing_days: bool = True,
 ) -> tuple[list[date], list[date]]:
+    """Return target days to render and target workdays that are absent from source."""
     parsed_day_set = set(parsed_days)
-    included = [current_day for current_day in target_days if current_day in parsed_day_set]
-    removed = [current_day for current_day in target_days if current_day not in parsed_day_set]
-    return included, removed
+    missing = [current_day for current_day in target_days if current_day not in parsed_day_set]
+    if include_missing_days:
+        return list(target_days), missing
+    return [current_day for current_day in target_days if current_day in parsed_day_set], missing
+
+
+def find_source_date_month_mismatches(
+    parsed_days: dict[date, ParsedDay],
+    target_year: int,
+    target_month_number: int,
+) -> list[SourceDateMonthMismatch]:
+    """Find unambiguous target days whose source counterpart has another month.
+
+    A candidate is offered to the user only when the target workday is absent and
+    exactly one parsed date has the same day number in a different month or year.
+    """
+    target_days = build_target_day_columns(target_year, target_month_number)
+    parsed_day_set = set(parsed_days)
+    mismatches: list[SourceDateMonthMismatch] = []
+    for target_day in target_days:
+        if target_day in parsed_day_set:
+            continue
+        candidates = [
+            source_day
+            for source_day in parsed_day_set
+            if source_day.day == target_day.day and source_day != target_day
+        ]
+        if len(candidates) == 1:
+            mismatches.append(
+                SourceDateMonthMismatch(
+                    source_date=candidates[0],
+                    target_date=target_day,
+                )
+            )
+    return mismatches
+
+
+def treat_source_date_month_mismatches_as_target_days(
+    parsed_days: dict[date, ParsedDay],
+    target_year: int,
+    target_month_number: int,
+) -> list[SourceDateMonthMismatch]:
+    """Reassign detected date mismatches in memory, without changing the source file."""
+    mismatches = find_source_date_month_mismatches(
+        parsed_days,
+        target_year,
+        target_month_number,
+    )
+    for mismatch in mismatches:
+        parsed_day = parsed_days.pop(mismatch.source_date)
+        parsed_days[mismatch.target_date] = replace(parsed_day, day=mismatch.target_date)
+    return mismatches
 
 
 def detect_attendance_month_from_file(attendance_path: str | Path) -> TargetMonth | None:
@@ -419,6 +501,7 @@ def parse_attendance_workbook(
                     mentiuni_days=parse_mentiuni_days(mentiuni_text, mentiuni_month_number),
                     mentiuni=mentiuni_text,
                     n_days=parse_co_days(sheet.cell(row, header.n_col).value) if header.n_col is not None else (),
+                    cm_days=parse_co_days(sheet.cell(row, header.cm_col).value) if header.cm_col is not None else (),
                 )
             )
 
@@ -574,6 +657,7 @@ def parse_attendance_pdf(
                 name=name,
                 co_days=parse_co_days(_pdf_cell(row, columns["co"])),
                 n_days=parse_co_days(_pdf_cell(row, columns["n"])) if columns.get("n") is not None else (),
+                cm_days=parse_co_days(_pdf_cell(row, columns["cm"])) if columns.get("cm") is not None else (),
                 mentiuni_days=parse_mentiuni_days(mentiuni_text, mentiuni_month_number),
                 mentiuni=mentiuni_text,
             )
@@ -592,6 +676,8 @@ def run_fill(
     template_sheet_name: str | None = None,
     attendance_path: str | Path | None = None,
     allow_attendance_month_mismatch: bool = False,
+    include_missing_source_days: bool = True,
+    treat_mismatched_source_dates_as_target: bool = False,
     progress_callback: Callable[[ProgressEvent], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> RunResult:
@@ -632,9 +718,30 @@ def run_fill(
             f"dar ai selectat {target_month_name}."
         )
 
-    year = min(parsed_days).year
+    year = min(parsed_day.year for parsed_day in parsed_days if parsed_day.month == month_number)
+    if treat_mismatched_source_dates_as_target:
+        corrected_mismatches = treat_source_date_month_mismatches_as_target_days(
+            parsed_days,
+            year,
+            month_number,
+        )
+        if corrected_mismatches:
+            corrected_dates = ", ".join(
+                f"{mismatch.source_date.strftime('%d.%m.%Y')} → "
+                f"{mismatch.target_date.strftime('%d.%m.%Y')}"
+                for mismatch in corrected_mismatches
+            )
+            warnings.append(
+                f"Date din sursă tratate ca luna țintă numai în raport: {corrected_dates}"
+            )
+
     all_target_days = build_target_day_columns(year, month_number)
-    target_days, removed_days = filter_target_days_to_source(all_target_days, parsed_days)
+    target_days, removed_days = filter_target_days_to_source(
+        all_target_days,
+        parsed_days,
+        include_missing_days=include_missing_source_days,
+    )
+    source_workday_count = len(all_target_days) - len(removed_days)
     if not target_days:
         raise ProcessorError("Nu am găsit zile lucrătoare valide din luna țintă în fișierul sursă.")
 
@@ -675,7 +782,47 @@ def run_fill(
             raise ProcessorError("Nu am putut detecta blocurile de completare din foaia generată.")
         layout = get_sheet_layout(build_result.worksheet, blocks)
 
-        warnings.extend(build_removed_day_warnings(removed_days))
+        pre_parsed_attendance: AttendanceWorkbook | None = None
+        added_employee_names: list[str] = []
+        if attendance_path is not None:
+            _emit(progress_callback, 50, "Verific dacă există angajați noi în Transatori+Detinuți")
+            pre_parsed_attendance = parse_attendance_workbook(
+                attendance_path,
+                target_month_number=month_number,
+                warnings=warnings,
+            )
+            if pre_parsed_attendance.month is not None:
+                attendance_month_matches = (
+                    pre_parsed_attendance.month.year == year
+                    and pre_parsed_attendance.month.month_number == month_number
+                )
+                if not attendance_month_matches and not allow_attendance_month_mismatch:
+                    raise ProcessorError(
+                        "Luna din Transatori+Detinuți este "
+                        f"{pre_parsed_attendance.month.month_name} {pre_parsed_attendance.month.year}, "
+                        f"dar luna țintă este {target_month_name} {year}."
+                    )
+            unmatched_names = find_unmatched_attendance_names(
+                build_result.worksheet, blocks, pre_parsed_attendance.entries
+            )
+            if unmatched_names:
+                blocks = append_new_employee_blocks(
+                    build_result.worksheet, workbook, blocks, layout, unmatched_names
+                )
+                added_employee_names = list(unmatched_names)
+                blocks = detect_sheet_blocks(build_result.worksheet, None)
+                layout = get_sheet_layout(build_result.worksheet, blocks)
+
+        _emit(progress_callback, 55, "Ordonez angajații alfabetic")
+        sort_sheet_blocks_alphabetically(build_result.worksheet, blocks)
+        renumber_sheet_blocks(build_result.worksheet, blocks)
+
+        warnings.extend(
+            build_removed_day_warnings(
+                removed_days,
+                included_as_zero=include_missing_source_days,
+            )
+        )
         differences: list[str] = []
 
         _check_cancel(cancel_check)
@@ -694,23 +841,25 @@ def run_fill(
         attendance_summary = None
         if attendance_path is not None:
             _check_cancel(cancel_check)
-            _emit(progress_callback, 74, "Aplic CO, N și mențiunile din Transatori+Detinuți")
-            attendance_data = parse_attendance_workbook(
-                attendance_path,
-                target_month_number=month_number,
-                warnings=warnings,
-            )
-            if attendance_data.month is not None:
-                attendance_month_matches = (
-                    attendance_data.month.year == year
-                    and attendance_data.month.month_number == month_number
+            _emit(progress_callback, 74, "Aplic CO, N, CM și mențiunile din Transatori+Detinuți")
+            attendance_data = pre_parsed_attendance
+            if attendance_data is None:
+                attendance_data = parse_attendance_workbook(
+                    attendance_path,
+                    target_month_number=month_number,
+                    warnings=warnings,
                 )
-                if not attendance_month_matches and not allow_attendance_month_mismatch:
-                    raise ProcessorError(
-                        "Luna din Transatori+Detinuți este "
-                        f"{attendance_data.month.month_name} {attendance_data.month.year}, "
-                        f"dar luna țintă este {target_month_name} {year}."
+                if attendance_data.month is not None:
+                    attendance_month_matches = (
+                        attendance_data.month.year == year
+                        and attendance_data.month.month_number == month_number
                     )
+                    if not attendance_month_matches and not allow_attendance_month_mismatch:
+                        raise ProcessorError(
+                            "Luna din Transatori+Detinuți este "
+                            f"{attendance_data.month.month_name} {attendance_data.month.year}, "
+                            f"dar luna țintă este {target_month_name} {year}."
+                        )
             attendance_summary = apply_attendance_adjustments(
                 worksheet=build_result.worksheet,
                 layout=layout,
@@ -720,18 +869,25 @@ def run_fill(
                 template_mode=template_mode,
                 fallback_off_fills=template_off_fills,
             )
+            if added_employee_names:
+                attendance_summary.added_employees = list(added_employee_names)
             blocks = detect_sheet_blocks(build_result.worksheet, None)
             layout = get_sheet_layout(build_result.worksheet, blocks)
 
         _emit(progress_callback, 80, "Rescriu formulele de sumar și recalcul")
-        rewrite_summary_formulas(build_result.worksheet, layout, blocks, len(target_days))
+        rewrite_summary_formulas(
+            build_result.worksheet,
+            layout,
+            blocks,
+            source_workday_count,
+        )
         _check_cancel(cancel_check)
         _emit(progress_callback, 88, "Construiesc foaia pentru teste fără formule")
         create_formula_free_test_sheet(
             workbook=workbook,
             source_worksheet=build_result.worksheet,
             test_sheet_name=test_sheet_name,
-            target_days=target_days,
+            workday_count=source_workday_count,
         )
         enable_full_recalculation(workbook)
 
@@ -743,7 +899,7 @@ def run_fill(
             raise _locked_file_error(target_path, writing=True) from exc
         return RunResult(
             output_file=target_path,
-            mapped_days=len(parsed_days),
+            mapped_days=source_workday_count,
             updated_blocks=len(blocks),
             warnings=warnings,
             differences=differences,
@@ -1049,7 +1205,7 @@ def create_formula_free_test_sheet(
     workbook: Workbook,
     source_worksheet: Worksheet,
     test_sheet_name: str,
-    target_days: list[date],
+    workday_count: int,
 ) -> Worksheet:
     if test_sheet_name in workbook.sheetnames:
         raise ProcessorError(f"Sheet-ul '{test_sheet_name}' există deja în workbook.")
@@ -1063,7 +1219,7 @@ def create_formula_free_test_sheet(
 
     blocks = detect_sheet_blocks(test_sheet, None)
     layout = get_sheet_layout(test_sheet, blocks)
-    write_static_generated_values(test_sheet, layout, blocks, len(target_days))
+    write_static_generated_values(test_sheet, layout, blocks, workday_count)
     clear_remaining_formulas(test_sheet)
     return test_sheet
 
@@ -1294,10 +1450,11 @@ def fill_generated_sheet(
 
             worksheet.cell(block.value_row, col).value = new_value
             worksheet.cell(block.transatori_row, col).value = new_transatori
-            use_off_style = (not has_source_day) or (
-                uses_predefined_template and _is_zero_result_pair(new_value, new_transatori)
-            )
-            apply_block_fill_profile(worksheet, block, col, profile, use_off_style=use_off_style)
+            if not has_source_day:
+                apply_co_day_fill(worksheet, block, col)
+            else:
+                use_off_style = uses_predefined_template and _is_zero_result_pair(new_value, new_transatori)
+                apply_block_fill_profile(worksheet, block, col, profile, use_off_style=use_off_style)
 
 
 def apply_attendance_adjustments(
@@ -1339,6 +1496,11 @@ def apply_attendance_adjustments(
                 continue
             absence_day_set.add(day_number)
             absence_days.append((day_number, "n"))
+        for day_number in match.entry.cm_days:
+            if day_number in absence_day_set:
+                continue
+            absence_day_set.add(day_number)
+            absence_days.append((day_number, "cm"))
 
         for day_number, absence_kind in absence_days:
             col = day_col_by_number.get(day_number)
@@ -1347,14 +1509,17 @@ def apply_attendance_adjustments(
             value_cell = worksheet.cell(block.value_row, col)
             transatori_cell = worksheet.cell(block.transatori_row, col)
             if _is_zero_result_pair(value_cell.value, transatori_cell.value):
+                apply_co_day_fill(worksheet, block, col)
                 continue
             value_cell.value = 0
             transatori_cell.value = 0
-            apply_block_fill_profile(worksheet, block, col, profile, use_off_style=True)
-            if absence_kind == "n":
+            apply_co_day_fill(worksheet, block, col)
+            if absence_kind == "co":
+                summary.co_days_applied += 1
+            elif absence_kind == "n":
                 summary.n_days_applied += 1
             else:
-                summary.co_days_applied += 1
+                summary.cm_days_applied += 1
 
         for day_number in match.entry.mentiuni_days:
             if day_number in absence_day_set:
@@ -1382,6 +1547,11 @@ def apply_attendance_adjustments(
 def apply_mentiuni_day_fill(worksheet: Worksheet, block: SheetBlock, col: int) -> None:
     for row in _block_day_rows(block):
         worksheet.cell(row, col).fill = copy(MENTIUNI_DAY_FILL)
+
+
+def apply_co_day_fill(worksheet: Worksheet, block: SheetBlock, col: int) -> None:
+    for row in _block_day_rows(block):
+        worksheet.cell(row, col).fill = copy(CO_DAY_FILL)
 
 
 def ensure_mentiuni_column(
@@ -1623,6 +1793,155 @@ def build_block_fill_profiles(
     return profiles
 
 
+def sort_sheet_blocks_alphabetically(worksheet: Worksheet, blocks: list[SheetBlock]) -> None:
+    if len(blocks) < 2:
+        return
+
+    snapshots = [
+        (
+            _block_sort_key(_cell_text(worksheet.cell(block.value_row, 2).value)),
+            index,
+            _capture_block_snapshot(worksheet, block),
+        )
+        for index, block in enumerate(blocks)
+    ]
+    ordered_snapshots = [snapshot for _sort_key, _index, snapshot in sorted(snapshots)]
+
+    for block, snapshot in zip(blocks, ordered_snapshots, strict=False):
+        _write_block_snapshot(worksheet, block, snapshot)
+
+
+def renumber_sheet_blocks(worksheet: Worksheet, blocks: list[SheetBlock]) -> None:
+    """Number the named employee blocks after they have been alphabetically sorted."""
+    employee_number = 1
+    for block in blocks:
+        name = _cell_text(worksheet.cell(block.value_row, 2).value)
+        serial_cell = worksheet.cell(block.value_row, 1)
+        if name:
+            serial_cell.value = employee_number
+            employee_number += 1
+        else:
+            serial_cell.value = None
+
+
+def find_unmatched_attendance_names(
+    worksheet: Worksheet,
+    blocks: list[SheetBlock],
+    entries: list[AttendanceEntry],
+) -> list[str]:
+    """Runs matching to find attendance entries that would not fit any existing block."""
+    dummy_summary = AttendanceApplySummary()
+    match_attendance_entries_to_blocks(worksheet, blocks, entries, dummy_summary)
+    seen: set[str] = set()
+    unique_names: list[str] = []
+    for name in dummy_summary.unmatched_names:
+        normalized = normalize_person_name(name)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_names.append(name.strip())
+    return unique_names
+
+
+def _lookup_employee_salary_from_other_sheets(
+    workbook: Workbook,
+    current_sheet: Worksheet,
+    employee_name: str,
+    layout: SheetLayout,
+) -> tuple[object, object]:
+    """Search other sheets in the workbook for the employee's salar-baza and premium."""
+    normalized_target = normalize_person_name(employee_name)
+    if not normalized_target:
+        return (None, None)
+    salar_baza_col = layout.summary_start_col + 8
+    premium_col = layout.summary_start_col + 11
+    for sheet_name in workbook.sheetnames:
+        sheet = workbook[sheet_name]
+        if sheet is current_sheet:
+            continue
+        try:
+            other_blocks = detect_sheet_blocks(sheet, None)
+            if not other_blocks:
+                continue
+            other_layout = get_sheet_layout(sheet, other_blocks)
+        except Exception:
+            continue
+        other_salar_col = other_layout.summary_start_col + 8
+        other_premium_col = other_layout.summary_start_col + 11
+        for block in other_blocks:
+            name_value = _cell_text(sheet.cell(block.value_row, 2).value)
+            if not name_value:
+                continue
+            if normalize_person_name(name_value) == normalized_target:
+                salar = sheet.cell(block.value_row, other_salar_col).value
+                premium = sheet.cell(block.value_row, other_premium_col).value
+                return (salar, premium)
+    return (None, None)
+
+
+def append_new_employee_blocks(
+    worksheet: Worksheet,
+    workbook: Workbook,
+    blocks: list[SheetBlock],
+    layout: SheetLayout,
+    new_names: list[str],
+) -> list[SheetBlock]:
+    """Append new employee blocks by cloning the last existing block's structure.
+
+    Formulas inside the copied snapshot may still reference the template block's rows,
+    but subsequent `fill_generated_sheet` and `rewrite_summary_formulas` regenerate all
+    per-block formulas from the block's own rows, so the final workbook is consistent.
+    """
+    if not new_names or not blocks:
+        return blocks
+
+    template_block = blocks[-1]
+    template_snapshot = _capture_block_snapshot(worksheet, template_block)
+    template_rows = _block_day_rows(template_block)
+    template_first_row = template_rows[0]
+
+    salar_baza_col = layout.summary_start_col + 8
+    nume_col = layout.summary_start_col + 10
+    premium_col = layout.summary_start_col + 11
+
+    next_row = template_block.diff_row + 1
+    new_blocks: list[SheetBlock] = []
+    for name in new_names:
+        offsets = tuple(row - template_first_row for row in template_rows)
+        new_block = SheetBlock(
+            header_row=next_row + offsets[0],
+            value_row=next_row + offsets[1],
+            transatori_row=next_row + offsets[2],
+            per_om_row=next_row + offsets[3],
+            norm_row=next_row + offsets[4],
+            diff_row=next_row + offsets[5],
+        )
+        _write_block_snapshot(worksheet, new_block, template_snapshot)
+        # Set the employee name in col 2 (used for sorting and identification)
+        worksheet.cell(new_block.value_row, 2).value = name
+        # Clear the "Nr crt" column so the caller can renumber later if needed
+        worksheet.cell(new_block.value_row, 1).value = None
+        # Update the trailing name column if it exists in the summary area
+        if nume_col <= worksheet.max_column:
+            worksheet.cell(new_block.value_row, nume_col).value = name
+        # Try to find salar bază / premium in other sheets; else leave blank
+        salar, premium = _lookup_employee_salary_from_other_sheets(
+            workbook, worksheet, name, layout
+        )
+        worksheet.cell(new_block.value_row, salar_baza_col).value = salar
+        worksheet.cell(new_block.value_row, premium_col).value = premium
+        new_blocks.append(new_block)
+        next_row = new_block.diff_row + 1
+
+    return blocks + new_blocks
+
+
+def _block_sort_key(name: str) -> tuple[int, str]:
+    if not name:
+        return (1, "")
+    return (0, normalize_person_name(name))
+
+
 def apply_block_fill_profile(
     worksheet: Worksheet,
     block: SheetBlock,
@@ -1639,6 +1958,48 @@ def apply_block_fill_profile(
 
 def _capture_block_fills(worksheet: Worksheet, block: SheetBlock, col: int) -> tuple:
     return tuple(copy(worksheet.cell(row, col).fill) for row in _block_day_rows(block))
+
+
+def _capture_block_snapshot(worksheet: Worksheet, block: SheetBlock) -> BlockSnapshot:
+    max_col = worksheet.max_column or 0
+    rows: list[tuple[BlockCellState, ...]] = []
+    row_heights: list[float | None] = []
+    for row in _block_day_rows(block):
+        row_heights.append(worksheet.row_dimensions[row].height)
+        cells: list[BlockCellState] = []
+        for col in range(1, max_col + 1):
+            cell = worksheet.cell(row, col)
+            cells.append(
+                BlockCellState(
+                    value=cell.value,
+                    style=copy(cell._style),
+                    number_format=cell.number_format,
+                    font=copy(cell.font),
+                    fill=copy(cell.fill),
+                    border=copy(cell.border),
+                    alignment=copy(cell.alignment),
+                    protection=copy(cell.protection),
+                    comment=copy(cell.comment) if cell.comment is not None else None,
+                )
+            )
+        rows.append(tuple(cells))
+    return BlockSnapshot(row_heights=tuple(row_heights), rows=tuple(rows))
+
+
+def _write_block_snapshot(worksheet: Worksheet, block: SheetBlock, snapshot: BlockSnapshot) -> None:
+    for target_row, height, row_cells in zip(_block_day_rows(block), snapshot.row_heights, snapshot.rows, strict=False):
+        worksheet.row_dimensions[target_row].height = height
+        for col, cell_state in enumerate(row_cells, start=1):
+            cell = worksheet.cell(target_row, col)
+            cell.value = cell_state.value
+            cell._style = copy(cell_state.style)
+            cell.number_format = cell_state.number_format
+            cell.font = copy(cell_state.font)
+            cell.fill = copy(cell_state.fill)
+            cell.border = copy(cell_state.border)
+            cell.alignment = copy(cell_state.alignment)
+            cell.protection = copy(cell_state.protection)
+            cell.comment = copy(cell_state.comment) if cell_state.comment is not None else None
 
 
 def _block_day_rows(block: SheetBlock) -> tuple[int, ...]:
@@ -1732,11 +2093,17 @@ def detect_sheet_blocks(worksheet: Worksheet, layout: SheetLayout | None) -> lis
     return blocks
 
 
-def build_removed_day_warnings(removed_days: list[date]) -> list[str]:
-    if not removed_days:
+def build_removed_day_warnings(
+    missing_days: list[date],
+    *,
+    included_as_zero: bool = True,
+) -> list[str]:
+    if not missing_days:
         return []
-    formatted_days = ", ".join(current_day.strftime("%d.%m.%Y") for current_day in removed_days)
-    return [f"Zile eliminate din tabel pentru că lipsesc din sursă: {formatted_days}"]
+    formatted_days = ", ".join(current_day.strftime("%d.%m.%Y") for current_day in missing_days)
+    if included_as_zero:
+        return [f"Zile colorate galben pentru că lipsesc din sursă: {formatted_days}"]
+    return [f"Zile neincluse în tabel pentru că lipsesc din sursă: {formatted_days}"]
 
 
 def pick_template_sheet(workbook: Workbook) -> Worksheet:
@@ -2038,7 +2405,12 @@ def _detect_month_from_pdf(pdf_path: str | Path) -> TargetMonth | None:
         raise ProcessorError("PDF-ul nu conține text extractibil. OCR nu este implementat în această versiune.")
 
     for line in lines:
-        month = _parse_month_from_text(line) or _parse_month_interval_from_text(line)
+        month = _parse_month_interval_from_text(line)
+        if month is not None:
+            return month
+
+    for line in lines:
+        month = _parse_month_from_text(line)
         if month is not None:
             return month
 
@@ -2068,6 +2440,7 @@ def _find_attendance_pdf_header(rows: list[list[str]]) -> tuple[int, dict[str, i
             "name": _find_pdf_header_column(normalized, "nume si prenume"),
             "co": _find_pdf_header_column(normalized, "co"),
             "n": _find_pdf_header_column(normalized, "n"),
+            "cm": _find_pdf_header_column(normalized, "cm"),
             "mentiuni": _find_pdf_header_column(normalized, "mentiuni"),
         }
         if columns["name"] is not None and columns["co"] is not None and columns["mentiuni"] is not None:
@@ -2095,6 +2468,14 @@ def _detect_month_from_sheet(worksheet: Worksheet) -> TargetMonth | None:
     max_col = min(worksheet.max_column or 0, 8)
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
+            # Prefer explicit day intervals over banner titles because the title
+            # is often copied from a previous month while the interval is updated.
+            month = _parse_month_interval_from_text(worksheet.cell(row, col).value)
+            if month is not None:
+                return month
+
+    for row in range(1, max_row + 1):
+        for col in range(1, max_col + 1):
             month = _parse_month_from_text(worksheet.cell(row, col).value)
             if month is not None:
                 return month
@@ -2113,6 +2494,7 @@ def _find_attendance_header(worksheet: Worksheet) -> AttendanceHeader | None:
         name_col = columns_by_label.get("nume si prenume")
         co_col = columns_by_label.get("co")
         n_col = columns_by_label.get("n")
+        cm_col = columns_by_label.get("cm")
         mentiuni_col = columns_by_label.get("mentiuni")
         if name_col and co_col and mentiuni_col:
             return AttendanceHeader(
@@ -2120,6 +2502,7 @@ def _find_attendance_header(worksheet: Worksheet) -> AttendanceHeader | None:
                 name_col=name_col,
                 co_col=co_col,
                 n_col=n_col,
+                cm_col=cm_col,
                 mentiuni_col=mentiuni_col,
             )
     return None
